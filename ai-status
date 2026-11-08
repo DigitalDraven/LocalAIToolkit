@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
+# shellcheck disable=SC1091
+source "$TOOLKIT_DIR/lib/common.sh"
+
+warn_legacy_command
+detect_platform
+
+print_ai_server_status() {
+    local health models model context port matched plugin_string
+
+    if [[ "${BACKEND:-}" == "vllm" ]]; then
+        port=8000
+        if curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1 \
+            || curl -fsS --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+            printf "%-18s %s\n" "vLLM server" "running"
+            printf "%-18s %s\n" "Port" "$port"
+            models="$(curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" 2>/dev/null || true)"
+            if command_exists jq && [[ -n "$models" ]]; then
+                model="$(printf '%s' "$models" | jq -r '.data[0].id // empty' 2>/dev/null)"
+                [[ -n "$model" ]] && printf "%-18s %s\n" "Model" "$model"
+            fi
+
+            # Match the running model to a local profile when possible so
+            # status can report its declared runtime extensions.
+            matched=""
+            if [[ -n "$model" ]]; then
+                discover_profiles
+                local p
+                for p in "${PROFILES[@]}"; do
+                    load_profile "$p" || continue
+                    if [[ "$model" == "${MODEL_ID:-}" || "$model" == "${HF_MODEL:-}" || "$model" == "${MODEL_NAME:-}" ]]; then
+                        matched="$p"
+                        break
+                    fi
+                done
+            fi
+            if [[ -n "$matched" ]]; then
+                if [[ ${VLLM_PLUGINS+x} && ${#VLLM_PLUGINS[@]} -gt 0 ]]; then
+                    printf "%-18s %s\n" "Plugins" "${VLLM_PLUGINS[*]}"
+                else
+                    printf "%-18s %s\n" "Plugins" "none"
+                fi
+            else
+                printf "%-18s %s\n" "Plugins" "profile not resolved"
+            fi
+        else
+            printf "%-18s %s\n" "vLLM server" "not running"
+        fi
+        if webui_running; then
+            printf "%-18s %s\n" "Open WebUI" "running (http://127.0.0.1:8080)"
+        else
+            printf "%-18s %s\n" "Open WebUI" "not running"
+        fi
+        return
+    fi
+
+    if ! health="$(curl -fsS --max-time 2 http://127.0.0.1:8080/health 2>/dev/null)"; then
+        printf "%-18s %s\n" "AI server" "not running"
+        return
+    fi
+
+    if [[ "$health" != *'"status":"ok"'* && "$health" != *'"status": "ok"'* ]]; then
+        printf "%-18s %s\n" "AI server" "starting"
+        return
+    fi
+
+    printf "%-18s %s\n" "AI server" "running"
+    printf "%-18s %s\n" "Port" "8080"
+
+    models="$(curl -fsS --max-time 2 http://127.0.0.1:8080/v1/models 2>/dev/null || true)"
+    if command_exists jq && [[ -n "$models" ]]; then
+        model="$(printf '%s' "$models" | jq -r '.data[0].id // empty' 2>/dev/null)"
+        context="$(printf '%s' "$models" | jq -r '.data[0].meta.n_ctx // empty' 2>/dev/null)"
+        [[ -n "$model" ]] && printf "%-18s %s\n" "Model" "$model"
+        [[ -n "$context" ]] && printf "%-18s %s\n" "Context" "$context"
+    fi
+}
+
+echo "============================================================"
+echo "              Local AI Toolkit ${TOOLKIT_VERSION}"
+echo "============================================================"
+echo
+printf "%-18s %s\n" "Hostname" "$(hostname)"
+printf "%-18s %s\n" "Platform" "$(platform_label)"
+printf "%-18s %s\n" "Backend" "$(backend_label)"
+printf "%-18s %s\n" "Power mode" "$(power_mode)"
+printf "%-18s %s\n" "Desktop" "$(if gui_detected; then echo GUI; else echo Headless; fi)"
+printf "%-18s %s\n" "RAM" "$(free -h | awk '/^Mem:/ {print $3 " used / " $2 ", " $7 " available"}')"
+printf "%-18s %s\n" "Swap" "$(free -h | awk '/^Swap:/ {print $3 " used / " $2}')"
+printf "%-18s %s\n" "HF token" "$(hf_token_status)"
+
+if command_exists nvidia-smi; then
+    printf "%-18s %s\n" "GPU" "nvidia-smi available"
+elif [[ -e /dev/nvhost-gpu ]]; then
+    printf "%-18s %s\n" "GPU" "Jetson GPU device"
+else
+    printf "%-18s %s\n" "GPU" "present (check nvidia runtime)"
+fi
+
+print_ai_server_status
+if command_exists docker && docker container inspect cosmos-media-studio >/dev/null 2>&1; then
+    printf "%-18s %s\n" "Media Studio" "$(docker inspect -f '{{.State.Status}}' cosmos-media-studio)"
+    printf "%-18s %s\n" "Media Studio URL" "http://127.0.0.1:7860"
+else
+    printf "%-18s %s\n" "Media Studio" "not installed/running"
+fi
+echo

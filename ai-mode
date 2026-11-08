@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
+# shellcheck disable=SC1091
+source "$TOOLKIT_DIR/lib/common.sh"
+
+warn_legacy_command
+detect_platform
+
+if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+    CURRENT="GUI"
+else
+    CURRENT="HEADLESS"
+fi
+
+echo "============================================================"
+echo "              Local AI Toolkit ${TOOLKIT_VERSION}"
+echo "------------------------------------------------------------"
+echo "  Platform : $(platform_label)"
+echo "============================================================"
+echo
+
+if [[ "$PLATFORM" == "dgx-spark" ]]; then
+    echo "Power / display mode helpers are for Jetson (Orin Nano, AGX Thor)."
+    echo "DGX Spark does not use nvpmodel or systemd graphical.target in the same way."
+    echo
+    echo "Current session display: $CURRENT"
+    echo "Default target: $(systemctl get-default 2>/dev/null || echo n/a)"
+    exit 0
+fi
+
+echo "Current session: $CURRENT"
+if command_exists nvpmodel; then
+    echo "Power mode   : $(power_mode)"
+fi
+echo "Default target: $(systemctl get-default 2>/dev/null || echo unknown)"
+echo
+echo "1) Switch to headless (multi-user.target) — reboot required"
+echo "2) Switch to GUI (graphical.target) — reboot required"
+echo "3) Show current mode"
+echo "0) Cancel"
+echo
+read -rp "Selection: " choice
+
+case "$choice" in
+    1)
+        echo
+        echo "Stopping the graphical target and switching to multi-user.target..."
+        sudo systemctl set-default multi-user.target
+        echo "Default target changed. Reboot to enter headless mode."
+        ;;
+    2)
+        echo
+        echo "Setting graphical.target as the default..."
+        sudo systemctl set-default graphical.target
+        echo "Default target changed. Reboot to enter GUI mode."
+        ;;
+    3)
+        echo "Current session: $CURRENT"
+        echo "Default target: $(systemctl get-default)"
+        if command_exists nvpmodel; then
+            echo "Power mode: $(power_mode)"
+        fi
+        ;;
+    0) exit 0 ;;
+    *) echo "Invalid selection."; exit 1 ;;
+esac

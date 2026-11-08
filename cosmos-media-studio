@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
+IMAGE_NAME="local-ai-toolkit/cosmos-media-studio:2.7.4"
+CONTAINER_NAME="cosmos-media-studio"
+OUTPUT_DIR="${COSMOS_MEDIA_OUTPUT_DIR:-$HOME/cosmos3-nano-media}"
+LEGACY_OUTPUT_DIR="$HOME/local-ai-toolkit-output/cosmos3-nano-media"
+ACTION="${1:-status}"
+
+need_docker() { command -v docker >/dev/null 2>&1 || { echo "ERROR: Docker is required."; exit 1; }; }
+container_exists() { docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
+case "$ACTION" in
+  start|restart)
+    need_docker
+    if [[ "$ACTION" == restart ]] && container_exists; then docker rm -f "$CONTAINER_NAME" >/dev/null; fi
+    if container_exists; then
+      if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" == true ]]; then
+        echo "Cosmos Media Studio is already running: http://127.0.0.1:7860"; exit 0
+      fi
+      docker rm "$CONTAINER_NAME" >/dev/null
+    fi
+    if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+      echo "Building isolated Gradio container image..."
+      docker build -t "$IMAGE_NAME" "$TOOLKIT_DIR/media-studio"
+    fi
+    mkdir -p "$OUTPUT_DIR"
+    if [[ -d "$LEGACY_OUTPUT_DIR" && "$LEGACY_OUTPUT_DIR" != "$OUTPUT_DIR" ]]; then
+      echo "Preserving existing Cosmos media from $LEGACY_OUTPUT_DIR..."
+      cp -an "$LEGACY_OUTPUT_DIR"/. "$OUTPUT_DIR"/
+    fi
+    docker run -d --name "$CONTAINER_NAME" --restart unless-stopped --network host \
+      -e COSMOS_API_BASE="${COSMOS_API_BASE:-http://127.0.0.1:8000/v1}" \
+      -e MEDIA_OUTPUT_DIR=/outputs -v "$OUTPUT_DIR:/outputs" "$IMAGE_NAME" >/dev/null
+    echo "Cosmos Media Studio started: http://127.0.0.1:7860"
+    echo "Output directory: $OUTPUT_DIR"
+    echo "Backend must be running at ${COSMOS_API_BASE:-http://127.0.0.1:8000/v1}."
+    ;;
+  stop)
+    need_docker
+    if container_exists; then
+      if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; then
+        docker stop "$CONTAINER_NAME" >/dev/null
+      fi
+      docker rm "$CONTAINER_NAME" >/dev/null
+      echo "Cosmos Media Studio stopped."
+    else
+      echo "Cosmos Media Studio is not installed/running."
+    fi
+    ;;
+  status)
+    need_docker
+    if container_exists; then
+      docker ps -a --filter "name=^/${CONTAINER_NAME}$" --format 'Container: {{.Names}} | State: {{.Status}}'
+      echo "URL: http://127.0.0.1:7860"
+      echo "Logs: cosmos-media-studio logs"
+    else echo "Cosmos Media Studio is not installed."; fi
+    ;;
+  logs)
+    need_docker
+    if container_exists; then docker logs --tail 100 -f "$CONTAINER_NAME"; else echo "Cosmos Media Studio container not found."; exit 1; fi
+    ;;
+  *) echo "Usage: cosmos-media-studio {start|stop|restart|status|logs}"; exit 2;;
+esac

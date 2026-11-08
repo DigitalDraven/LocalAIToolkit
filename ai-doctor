@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
+# shellcheck disable=SC1091
+source "$TOOLKIT_DIR/lib/common.sh"
+
+detect_platform
+
+pass() { printf "PASS  %-28s %s\n" "$1" "$2"; }
+warn() { printf "WARN  %-28s %s\n" "$1" "$2"; }
+fail() { printf "FAIL  %-28s %s\n" "$1" "$2"; }
+
+echo "============================================================"
+echo "              Local AI Toolkit Doctor ${TOOLKIT_VERSION}"
+echo "------------------------------------------------------------"
+echo "  Platform : $(platform_label)"
+echo "  Backend  : $(backend_label)"
+echo "============================================================"
+echo
+
+pass "Platform" "$(platform_label) / $(backend_label)"
+pass "Models dir" "$MODELS_DIR"
+
+nconf=0
+shopt -s nullglob
+for f in "$MODELS_DIR"/*.conf; do
+    nconf=$((nconf + 1))
+done
+shopt -u nullglob
+if (( nconf > 0 )); then
+    pass "Model profiles" "$nconf found"
+else
+    fail "Model profiles" "none in $MODELS_DIR"
+fi
+
+command_exists docker && pass "Docker command" "$(docker --version | head -1)" || fail "Docker command" "not found"
+
+if sudo docker info >/dev/null 2>&1; then
+    pass "Docker daemon" "reachable"
+else
+    fail "Docker daemon" "not reachable"
+fi
+
+if [[ -e /dev/nvhost-gpu ]]; then
+    pass "Jetson GPU device" "/dev/nvhost-gpu present"
+elif command_exists nvidia-smi; then
+    pass "NVIDIA GPU" "nvidia-smi available"
+else
+    warn "GPU device" "no /dev/nvhost-gpu and no nvidia-smi"
+fi
+
+runtimes="$(sudo -n docker info --format '{{json .Runtimes}}' 2>/dev/null || true)"
+if [[ "$runtimes" == *'"nvidia"'* ]]; then
+    pass "NVIDIA Docker runtime" "configured"
+elif [[ -n "$runtimes" ]]; then
+    warn "NVIDIA Docker runtime" "not listed by Docker"
+else
+    warn "NVIDIA Docker runtime" "Docker runtime information unavailable"
+fi
+
+if command_exists nvpmodel; then
+    pass "Power mode" "$(power_mode)"
+else
+    if [[ "$PLATFORM" == "dgx-spark" ]]; then
+        pass "Power mode" "n/a on DGX Spark"
+    else
+        warn "Power mode" "nvpmodel not found"
+    fi
+fi
+
+if [[ -d "$HOME/.cache/huggingface" ]]; then
+    pass "HuggingFace cache" "present"
+else
+    warn "HuggingFace cache" "directory not found"
+fi
+
+if hf_token_present; then
+    pass "HF token" "present"
+else
+    warn "HF token" "missing (needed for gated models)"
+fi
+
+if network_ok; then
+    pass "Network" "online"
+else
+    warn "Network" "offline (local images still work)"
+fi
+
+avail="$(ram_available_mb)"
+swap="$(swap_used_mb)"
+if ((avail >= 1500)); then
+    pass "RAM available" "${avail} MB"
+elif ((avail >= 750)); then
+    warn "RAM available" "${avail} MB"
+else
+    fail "RAM available" "${avail} MB"
+fi
+
+if ((swap <= 512)); then
+    pass "Swap pressure" "${swap} MB used"
+else
+    warn "Swap pressure" "${swap} MB used"
+fi
+
+disk="$(df -h "$HOME" | awk 'NR==2 {print $5 " used, " $4 " free"}')"
+pass "Disk" "$disk"
+
+if [[ "$(systemctl get-default 2>/dev/null)" == "multi-user.target" ]]; then
+    pass "Default boot target" "headless"
+else
+    pass "Default boot target" "$(systemctl get-default 2>/dev/null || echo unknown)"
+fi
+
+if [[ "$BACKEND" == "vllm" ]]; then
+    if validate_vllm_plugins; then
+        if [[ ${VLLM_PLUGINS+x} && ${#VLLM_PLUGINS[@]} -gt 0 ]]; then
+            pass "vLLM plugins" "${VLLM_PLUGINS[*]} present"
+        else
+            pass "vLLM plugins" "none required"
+        fi
+    else
+        fail "vLLM plugins" "one or more required plugins are missing"
+    fi
+    if webui_running; then
+        pass "Open WebUI" "running"
+    else
+        warn "Open WebUI" "not running"
+    fi
+    if [[ "$PLATFORM" == "dgx-spark" ]]; then
+        warn "NGC login" "Spark vLLM images are on nvcr.io — docker login nvcr.io if pulls fail"
+    fi
+fi
+
+echo
+echo "Doctor complete."

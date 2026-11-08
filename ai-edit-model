@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+set -u
+
+# ai-edit-model — guided editing of an existing model profile
+# for the Local AI Toolkit (v2.5).
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
+MODELS_DIR="${MODELS_DIR:-$TOOLKIT_DIR/models}"
+TOOLKIT_VERSION="v2.7.5"
+
+# shellcheck disable=SC1091
+source "$TOOLKIT_DIR/lib/common.sh"
+warn_legacy_command
+detect_platform
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+prompt() {
+    local text="$1" def="${2:-}" reply
+    if [[ -n "$def" ]]; then
+        read -rp "$text [$def]: " reply
+        echo "${reply:-$def}"
+    else
+        read -rp "$text: " reply
+        echo "$reply"
+    fi
+}
+
+# Read a single KEY=value (or KEY="value") from a conf file.
+get_conf() {
+    local file="$1" key="$2"
+    local line val
+    line=$(grep -E "^${key}=" "$file" 2>/dev/null | head -1) || true
+    [[ -z "$line" ]] && { echo ""; return; }
+    val="${line#*=}"
+    # Strip surrounding double quotes if present.
+    if [[ "$val" == \"*\" ]]; then
+        val="${val:1:-1}"
+    fi
+    echo "$val"
+}
+
+# Replace or insert KEY="value" (or bare number) in a conf file.
+set_conf() {
+    local file="$1" key="$2" value="$3" quote="${4:-1}"
+    local tmp
+    tmp=$(mktemp)
+
+    if grep -qE "^${key}=" "$file" 2>/dev/null; then
+        if [[ "$quote" == "1" ]]; then
+            sed -E "s|^${key}=.*|${key}=\"${value}\"|" "$file" > "$tmp"
+        else
+            sed -E "s|^${key}=.*|${key}=${value}|" "$file" > "$tmp"
+        fi
+    else
+        # Append before the runtime block if possible, else at end.
+        if grep -qE '^RECOMMENDED_RUNTIME=' "$file"; then
+            awk -v k="$key" -v v="$value" -v q="$quote" '
+                /^RECOMMENDED_RUNTIME=/ {
+                    if (q == "1") print k "=\"" v "\""
+                    else print k "=" v
+                }
+                { print }
+            ' "$file" > "$tmp"
+        else
+            cp "$file" "$tmp"
+            if [[ "$quote" == "1" ]]; then
+                echo "${key}=\"${value}\"" >> "$tmp"
+            else
+                echo "${key}=${value}" >> "$tmp"
+            fi
+        fi
+    fi
+    mv "$tmp" "$file"
+}
+
+# Set an array-style line such as VALIDATED_CONTEXTS=(a b c)
+set_conf_raw() {
+    local file="$1" key="$2" raw="$3"
+    local tmp
+    tmp=$(mktemp)
+    if grep -qE "^${key}=" "$file" 2>/dev/null; then
+        sed -E "s|^${key}=.*|${key}=${raw}|" "$file" > "$tmp"
+    else
+        cp "$file" "$tmp"
+        echo "${key}=${raw}" >> "$tmp"
+    fi
+    mv "$tmp" "$file"
+}
+
+list_profiles() {
+    local -a files=()
+    local f id name enabled note
+    shopt -s nullglob
+    files=("$MODELS_DIR"/*.conf)
+    shopt -u nullglob
+
+    if ((${#files[@]} == 0)); then
+        echo "No model profiles found in $MODELS_DIR"
+        return 1
+    fi
+
+    PROFILE_FILES=()
+    echo "Select a model profile to edit:"
+    echo
+    local i=1
+    for f in "${files[@]}"; do
+        id=$(get_conf "$f" "MODEL_ID")
+        name=$(get_conf "$f" "MODEL_NAME")
+        enabled=$(get_conf "$f" "ENABLED")
+        note=$(get_conf "$f" "MODEL_NOTE")
+        [[ -z "$id" ]] && id="${f##*/}"
+        [[ -z "$name" ]] && name="$id"
+        if [[ "$enabled" == "0" ]]; then
+            printf "  %d) %-28s %s  [disabled]\n" "$i" "$name" "${note:-}"
+        else
+            printf "  %d) %-28s %s\n" "$i" "$name" "${note:-}"
+        fi
+        PROFILE_FILES+=("$f")
+        ((i++))
+    done
+    echo "  0) Cancel"
+    echo
+    return 0
+}
+
+show_profile_summary() {
+    local f="$1"
+    echo
+    echo "------------------------------------------------------------"
+    printf "  %-22s: %s\n" "File" "$f"
+    printf "  %-22s: %s\n" "MODEL_ID" "$(get_conf "$f" MODEL_ID)"
+    printf "  %-22s: %s\n" "MODEL_NAME" "$(get_conf "$f" MODEL_NAME)"
+    printf "  %-22s: %s\n" "ENABLED" "$(get_conf "$f" ENABLED)"
+    printf "  %-22s: %s\n" "MODEL_NOTE" "$(get_conf "$f" MODEL_NOTE)"
+    printf "  %-22s: %s\n" "HF_MODEL" "$(get_conf "$f" HF_MODEL)"
+    printf "  %-22s: %s\n" "RECOMMENDED_RUNTIME" "$(get_conf "$f" RECOMMENDED_RUNTIME)"
+    printf "  %-22s: %s\n" "RECOMMENDED_CONTEXT" "$(get_conf "$f" RECOMMENDED_CONTEXT)"
+    printf "  %-22s: %s\n" "GUI_RECOMMENDED_CONTEXT" "$(get_conf "$f" GUI_RECOMMENDED_CONTEXT)"
+    printf "  %-22s: %s\n" "HEADLESS_RECOMMENDED_CONTEXT" "$(get_conf "$f" HEADLESS_RECOMMENDED_CONTEXT)"
+    printf "  %-22s: %s\n" "GPU_LAYERS" "$(get_conf "$f" GPU_LAYERS)"
+    printf "  %-22s: %s\n" "FLASH_ATTN" "$(get_conf "$f" FLASH_ATTN)"
+    printf "  %-22s: %s\n" "EXTRA_ARGS" "$(get_conf "$f" EXTRA_ARGS)"
+    printf "  %-22s: %s\n" "BACKEND" "$(get_conf "$f" BACKEND)"
+    printf "  %-22s: %s\n" "IMAGE" "$(get_conf "$f" IMAGE)"
+    printf "  %-22s: %s\n" "MAX_MODEL_LEN" "$(get_conf "$f" MAX_MODEL_LEN)"
+    printf "  %-22s: %s\n" "GPU_MEMORY_UTILIZATION" "$(get_conf "$f" GPU_MEMORY_UTILIZATION)"
+    printf "  %-22s: %s\n" "TRUST_REMOTE_CODE" "$(get_conf "$f" TRUST_REMOTE_CODE)"
+    printf "  %-22s: %s\n" "NEEDS_HF_TOKEN" "$(get_conf "$f" NEEDS_HF_TOKEN)"
+    echo "------------------------------------------------------------"
+}
+
+edit_field_menu() {
+    echo
+    echo "What would you like to change?"
+    echo "  1) Display name (MODEL_NAME)"
+    echo "  2) Category / note (MODEL_NOTE)"
+    echo "  3) Enable / disable (ENABLED)"
+    echo "  4) Hugging Face model + quant (HF_MODEL)"
+    echo "  5) Recommended runtime"
+    echo "  6) Context sizes (recommended / GUI / headless)"
+    echo "  7) GPU layers (GPU_LAYERS)"
+    echo "  8) Flash attention (FLASH_ATTN)"
+    echo "  9) Extra args (EXTRA_ARGS)"
+    echo " 10) NVIDIA image digest"
+    echo " 11) Upstream image digest"
+    echo " 12) Open full file in editor"
+    echo " 13) Container IMAGE"
+    echo " 14) Max model length (vLLM)"
+    echo " 15) GPU memory utilization (vLLM)"
+    echo " 16) trust-remote-code / needs-token (vLLM)"
+    echo "  0) Done"
+    echo
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+clear
+echo "============================================================"
+printf "             Local AI Toolkit %s\n" "$TOOLKIT_VERSION"
+echo "                   Edit a Model"
+echo "============================================================"
+echo
+
+TARGET_FILE=""
+
+# Optional: accept MODEL_ID as first argument.
+if [[ $# -ge 1 && -n "${1:-}" ]]; then
+    cand="$MODELS_DIR/${1}.conf"
+    if [[ -f "$cand" ]]; then
+        TARGET_FILE="$cand"
+    else
+        echo "No profile found for ID: $1"
+        echo
+    fi
+fi
+
+if [[ -z "$TARGET_FILE" ]]; then
+    list_profiles || exit 1
+    while true; do
+        sel=$(prompt "Selection" "0")
+        if [[ "$sel" == "0" ]]; then
+            exit 0
+        fi
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#PROFILE_FILES[@]} )); then
+            TARGET_FILE="${PROFILE_FILES[$((sel-1))]}"
+            break
+        fi
+        echo "Invalid selection."
+    done
+fi
+
+while true; do
+    show_profile_summary "$TARGET_FILE"
+    edit_field_menu
+    choice=$(prompt "Selection" "0")
+
+    case "$choice" in
+        0|"")
+            echo "Done."
+            exit 0
+            ;;
+        1)
+            cur=$(get_conf "$TARGET_FILE" MODEL_NAME)
+            new=$(prompt "Display name" "$cur")
+            [[ -n "$new" ]] && set_conf "$TARGET_FILE" MODEL_NAME "$new" 1
+            ;;
+        2)
+            cur=$(get_conf "$TARGET_FILE" MODEL_NOTE)
+            new=$(prompt "Category / note" "$cur")
+            set_conf "$TARGET_FILE" MODEL_NOTE "$new" 1
+            ;;
+        3)
+            cur=$(get_conf "$TARGET_FILE" ENABLED)
+            echo "  1) Enabled"
+            echo "  2) Disabled"
+            def=1
+            [[ "$cur" == "0" ]] && def=2
+            sel=$(prompt "Selection" "$def")
+            if [[ "$sel" == "1" ]]; then
+                set_conf "$TARGET_FILE" ENABLED "1" 0
+            elif [[ "$sel" == "2" ]]; then
+                set_conf "$TARGET_FILE" ENABLED "0" 0
+            fi
+            ;;
+        4)
+            cur=$(get_conf "$TARGET_FILE" HF_MODEL)
+            new=$(prompt "HF_MODEL (repo:QUANT)" "$cur")
+            [[ -n "$new" ]] && set_conf "$TARGET_FILE" HF_MODEL "$new" 1
+            ;;
+        5)
+            cur=$(get_conf "$TARGET_FILE" RECOMMENDED_RUNTIME)
+            echo "  1) nvidia-jetson"
+            echo "  2) upstream"
+            def=1
+            [[ "$cur" == "upstream" ]] && def=2
+            sel=$(prompt "Selection" "$def")
+            if [[ "$sel" == "1" ]]; then
+                set_conf "$TARGET_FILE" RECOMMENDED_RUNTIME "nvidia-jetson" 1
+                # Keep top-level IMAGE/VOLUME/SERVER aligned with preference.
+                nimg=$(get_conf "$TARGET_FILE" RUNTIME_IMAGE_NVIDIA_JETSON)
+                [[ -n "$nimg" ]] && set_conf "$TARGET_FILE" IMAGE "$nimg" 1
+                set_conf "$TARGET_FILE" VOLUME_PATH '$HOME/.cache/huggingface/hub:/data/models/huggingface' 1
+                set_conf "$TARGET_FILE" SERVER_COMMAND "llama-server" 1
+                set_conf_raw "$TARGET_FILE" RUNTIME_OPTIONS '("nvidia-jetson" "upstream")'
+            elif [[ "$sel" == "2" ]]; then
+                set_conf "$TARGET_FILE" RECOMMENDED_RUNTIME "upstream" 1
+                uimg=$(get_conf "$TARGET_FILE" RUNTIME_IMAGE_UPSTREAM)
+                [[ -n "$uimg" ]] && set_conf "$TARGET_FILE" IMAGE "$uimg" 1
+                set_conf "$TARGET_FILE" VOLUME_PATH '$HOME/.cache/huggingface:/root/.cache/huggingface' 1
+                set_conf "$TARGET_FILE" SERVER_COMMAND "" 1
+                set_conf_raw "$TARGET_FILE" RUNTIME_OPTIONS '("upstream" "nvidia-jetson")'
+            fi
+            ;;
+        6)
+            rec=$(get_conf "$TARGET_FILE" RECOMMENDED_CONTEXT)
+            gui=$(get_conf "$TARGET_FILE" GUI_RECOMMENDED_CONTEXT)
+            head=$(get_conf "$TARGET_FILE" HEADLESS_RECOMMENDED_CONTEXT)
+            [[ -z "$gui" ]] && gui="$rec"
+            [[ -z "$head" ]] && head="$rec"
+            new_rec=$(prompt "Recommended context" "$rec")
+            new_gui=$(prompt "GUI recommended context" "$gui")
+            new_head=$(prompt "Headless recommended context" "$head")
+            if [[ "$new_rec" =~ ^[1-9][0-9]*$ ]]; then
+                set_conf "$TARGET_FILE" RECOMMENDED_CONTEXT "$new_rec" 0
+            fi
+            if [[ "$new_gui" =~ ^[1-9][0-9]*$ ]]; then
+                set_conf "$TARGET_FILE" GUI_RECOMMENDED_CONTEXT "$new_gui" 0
+            fi
+            if [[ "$new_head" =~ ^[1-9][0-9]*$ ]]; then
+                set_conf "$TARGET_FILE" HEADLESS_RECOMMENDED_CONTEXT "$new_head" 0
+            fi
+            # Rebuild a simple validated list from the new recommended value.
+            if [[ "$new_rec" =~ ^[1-9][0-9]*$ ]]; then
+                vals=()
+                for c in 4096 8192 16384 32768 49152; do
+                    if (( c <= new_rec )); then
+                        vals+=("$c")
+                    fi
+                done
+                found=0
+                for c in "${vals[@]}"; do
+                    [[ "$c" == "$new_rec" ]] && found=1 && break
+                done
+                (( found == 0 )) && vals+=("$new_rec")
+                set_conf_raw "$TARGET_FILE" VALIDATED_CONTEXTS "(${vals[*]})"
+            fi
+            ;;
+        7)
+            cur=$(get_conf "$TARGET_FILE" GPU_LAYERS)
+            echo "(Leave empty to omit -ngl entirely)"
+            new=$(prompt "GPU_LAYERS" "$cur")
+            set_conf "$TARGET_FILE" GPU_LAYERS "$new" 0
+            ;;
+        8)
+            cur=$(get_conf "$TARGET_FILE" FLASH_ATTN)
+            echo "(Leave empty to omit flash-attn flag)"
+            echo "Common value: --flash-attn on"
+            new=$(prompt "FLASH_ATTN" "$cur")
+            set_conf "$TARGET_FILE" FLASH_ATTN "$new" 1
+            ;;
+        9)
+            cur=$(get_conf "$TARGET_FILE" EXTRA_ARGS)
+            new=$(prompt "EXTRA_ARGS" "$cur")
+            set_conf "$TARGET_FILE" EXTRA_ARGS "$new" 1
+            ;;
+        10)
+            cur=$(get_conf "$TARGET_FILE" RUNTIME_IMAGE_NVIDIA_JETSON)
+            new=$(prompt "NVIDIA image reference" "$cur")
+            [[ -n "$new" ]] && set_conf "$TARGET_FILE" RUNTIME_IMAGE_NVIDIA_JETSON "$new" 1
+            # If this profile prefers nvidia-jetson, keep top-level IMAGE in sync.
+            pref=$(get_conf "$TARGET_FILE" RECOMMENDED_RUNTIME)
+            if [[ "$pref" == "nvidia-jetson" && -n "$new" ]]; then
+                set_conf "$TARGET_FILE" IMAGE "$new" 1
+            fi
+            ;;
+        11)
+            cur=$(get_conf "$TARGET_FILE" RUNTIME_IMAGE_UPSTREAM)
+            new=$(prompt "Upstream image reference" "$cur")
+            [[ -n "$new" ]] && set_conf "$TARGET_FILE" RUNTIME_IMAGE_UPSTREAM "$new" 1
+            pref=$(get_conf "$TARGET_FILE" RECOMMENDED_RUNTIME)
+            if [[ "$pref" == "upstream" && -n "$new" ]]; then
+                set_conf "$TARGET_FILE" IMAGE "$new" 1
+            fi
+            ;;
+        12)
+            editor="${EDITOR:-nano}"
+            if command -v "$editor" >/dev/null 2>&1; then
+                "$editor" "$TARGET_FILE"
+            else
+                echo "Open $TARGET_FILE in your preferred editor."
+            fi
+            ;;
+
+        13)
+            cur=$(get_conf "$TARGET_FILE" IMAGE)
+            new=$(prompt "IMAGE" "$cur")
+            [[ -n "$new" ]] && set_conf "$TARGET_FILE" IMAGE "$new" 1
+            ;;
+        14)
+            cur=$(get_conf "$TARGET_FILE" RECOMMENDED_MAX_MODEL_LEN)
+            [[ -z "$cur" ]] && cur=$(get_conf "$TARGET_FILE" MAX_MODEL_LEN)
+            new=$(prompt "Recommended max model length" "$cur")
+            if [[ "$new" =~ ^[1-9][0-9]*$ ]]; then
+                set_conf "$TARGET_FILE" MAX_MODEL_LEN "$new" 0
+                set_conf "$TARGET_FILE" RECOMMENDED_MAX_MODEL_LEN "$new" 0
+            fi
+            ;;
+        15)
+            cur=$(get_conf "$TARGET_FILE" GPU_MEMORY_UTILIZATION)
+            new=$(prompt "GPU_MEMORY_UTILIZATION" "${cur:-0.85}")
+            [[ -n "$new" ]] && set_conf "$TARGET_FILE" GPU_MEMORY_UTILIZATION "$new" 0
+            ;;
+        16)
+            cur=$(get_conf "$TARGET_FILE" TRUST_REMOTE_CODE)
+            echo "trust-remote-code: 1) No  2) Yes"
+            def=1
+            [[ "$cur" == "1" ]] && def=2
+            sel=$(prompt "Selection" "$def")
+            if [[ "$sel" == "2" ]]; then
+                set_conf "$TARGET_FILE" TRUST_REMOTE_CODE "1" 0
+            else
+                set_conf "$TARGET_FILE" TRUST_REMOTE_CODE "0" 0
+            fi
+            cur=$(get_conf "$TARGET_FILE" NEEDS_HF_TOKEN)
+            echo "Needs HF token: 1) Yes  2) No"
+            def=1
+            [[ "$cur" == "0" ]] && def=2
+            sel=$(prompt "Selection" "$def")
+            if [[ "$sel" == "2" ]]; then
+                set_conf "$TARGET_FILE" NEEDS_HF_TOKEN "0" 0
+            else
+                set_conf "$TARGET_FILE" NEEDS_HF_TOKEN "1" 0
+            fi
+            ;;
+        *)
+            echo "Invalid selection."
+            ;;
+    esac
+done

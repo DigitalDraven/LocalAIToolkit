@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
+
+# Start each AI session from a clean filesystem/page-cache baseline so the
+# RAM shown below reflects memory available for the actual session.
+sync
+if ! sudo sysctl -w vm.drop_caches=3 >/dev/null; then
+    echo "Warning: could not reclaim filesystem/page caches; continuing."
+fi
+
+# shellcheck disable=SC1091
+source "$TOOLKIT_DIR/lib/common.sh"
+
+detect_platform
+
+discover_profiles
+
+if ((${#PROFILES[@]} == 0)); then
+    echo "No model profiles were found in $MODELS_DIR."
+    exit 1
+fi
+
+clear
+show_header
+show_dashboard
+
+show_model_menu
+read -rp "Selection: " choice
+[[ "$choice" == "0" ]] && exit 0
+[[ "$choice" =~ ^[0-9]+$ ]] || { echo "Invalid selection."; exit 1; }
+idx=$((choice-1))
+((idx >= 0 && idx < ${#PROFILES[@]})) || { echo "Invalid selection."; exit 1; }
+
+profile="${PROFILES[$idx]}"
+load_profile "$profile" || { echo "Could not load profile."; exit 1; }
+validate_profile || { echo "Model profile is incomplete or invalid."; exit 1; }
+
+if ! model_enabled; then
+    echo
+    echo "$MODEL_NAME is disabled."
+    echo "${MODEL_NOTE:-No validated profile exists yet.}"
+    exit 1
+fi
+
+select_llamacpp_runtime_and_context() {
+    if ((${#RUNTIME_OPTIONS[@]})); then
+        show_runtime_menu
+        read -rp "Runtime selection: " rchoice
+        [[ "$rchoice" == "0" ]] && exit 0
+
+        if [[ "$rchoice" == "1" ]]; then
+            RUNTIME="${RECOMMENDED_RUNTIME}"
+            RUNTIME_LABEL="recommended"
+        elif [[ "$rchoice" =~ ^[0-9]+$ ]] && ((rchoice >= 2 && rchoice < ${#RUNTIME_OPTIONS[@]}+2)); then
+            RUNTIME="${RUNTIME_OPTIONS[$((rchoice-2))]}"
+            RUNTIME_LABEL="selected"
+        else
+            echo "Invalid selection."
+            exit 1
+        fi
+
+        apply_runtime "$RUNTIME" || { echo "Could not apply runtime profile."; exit 1; }
+    else
+        RUNTIME="legacy"
+        RUNTIME_LABEL="model profile"
+    fi
+
+    show_context_menu
+    read -rp "Context selection: " cchoice
+    [[ "$cchoice" == "0" ]] && exit 0
+
+    if [[ "$cchoice" == "1" ]]; then
+        CONTEXT="$(recommended_context)"
+        CONTEXT_LABEL="recommended"
+    elif [[ "$cchoice" =~ ^[0-9]+$ ]] && (( cchoice >= 2 && cchoice < ${#CONTEXT_ALTS[@]}+2 )); then
+        CONTEXT="${CONTEXT_ALTS[$((cchoice-2))]}"
+        CONTEXT_LABEL="common"
+    elif (( cchoice == CONTEXT_CUSTOM_OPTION )); then
+        read -rp "Enter context size: " CONTEXT
+        [[ "$CONTEXT" =~ ^[1-9][0-9]*$ ]] || { echo "Context must be a positive integer."; exit 1; }
+        CONTEXT_LABEL="custom"
+    else
+        echo "Invalid selection."
+        exit 1
+    fi
+}
+
+select_vllm_max_len() {
+    show_max_len_menu
+    read -rp "Max-len selection: " cchoice
+    [[ "$cchoice" == "0" ]] && exit 0
+
+    if [[ "$cchoice" == "1" ]]; then
+        MAX_MODEL_LEN="$(recommended_max_len)"
+        CONTEXT_LABEL="recommended"
+    elif [[ "$cchoice" =~ ^[0-9]+$ ]] && (( cchoice >= 2 && cchoice < ${#CONTEXT_ALTS[@]}+2 )); then
+        MAX_MODEL_LEN="${CONTEXT_ALTS[$((cchoice-2))]}"
+        CONTEXT_LABEL="common"
+    elif (( cchoice == CONTEXT_CUSTOM_OPTION )); then
+        read -rp "Enter max model length: " MAX_MODEL_LEN
+        [[ "$MAX_MODEL_LEN" =~ ^[1-9][0-9]*$ ]] || { echo "Max model length must be a positive integer."; exit 1; }
+        CONTEXT_LABEL="custom"
+    else
+        echo "Invalid selection."
+        exit 1
+    fi
+}
+
+if [[ "$BACKEND" == "diffusers" ]]; then
+    if ! validate_diffusers_plugins; then exit 1; fi
+    show_diffusers_launch_summary
+    if [[ "${DIFFUSERS_MODE:-stage_a}" == "api" ]]; then
+        echo "Stage B: persistent Diffusers API"
+        echo "The first launch may create a persistent model-scoped Python environment."
+        echo "API: http://${HOST:-0.0.0.0}:${PORT:-8000}"
+    else
+        echo "Stage A: native Diffusers pipeline test"
+        echo "The first launch may create a persistent model-scoped Python environment."
+    fi
+    echo
+    read -rp "Launch? [Y/n]: " launch
+    [[ "${launch:-Y}" =~ ^[Nn]$ ]] && exit 0
+
+    echo
+    if ! prepare_image; then
+        exit 1
+    fi
+
+    echo
+    echo "Launching $MODEL_NAME..."
+    echo
+
+    set +e
+    launch_diffusers
+    rc=$?
+    set -e
+
+    if ((rc == 0)); then
+        echo
+        if [[ "${DIFFUSERS_MODE:-stage_a}" == "api" ]]; then
+            echo "Stage B API stopped."
+        else
+            echo "Stage A completed."
+        fi
+    else
+        show_launch_failure "$rc"
+    fi
+    exit "$rc"
+fi
+
+if [[ "$BACKEND" == "vllm" ]]; then
+    select_vllm_max_len
+    if ! validate_vllm_plugins; then exit 1; fi
+    show_vllm_launch_summary
+    show_vllm_requirements
+
+    if [[ "${NEEDS_HF_TOKEN:-0}" == "1" ]] && ! hf_token_present; then
+        echo "This model is marked as gated (NEEDS_HF_TOKEN=1) and no Hugging Face token was found."
+        echo "Set HF_TOKEN in the environment, or place a token at ~/.cache/huggingface/token."
+        echo
+        read -rp "Continue anyway? [y/N]: " cont
+        [[ "$cont" =~ ^[Yy]$ ]] || exit 1
+    fi
+
+    read -rp "Launch? [Y/n]: " launch
+    [[ "${launch:-Y}" =~ ^[Nn]$ ]] && exit 0
+
+    echo
+    if ! prepare_image; then
+        exit 1
+    fi
+
+    if [[ "${STARTUP_INTERFACE:-open-webui}" == "cosmos-media-studio" ]]; then
+        echo
+        read -rp "Start Cosmos Media Studio for image/video generation? [Y/n]: " media_ans
+        if [[ ! "${media_ans:-Y}" =~ ^[Nn]$ ]]; then
+            if command -v cosmos-media-studio >/dev/null 2>&1; then
+                cosmos-media-studio start
+            else
+                echo "WARNING: cosmos-media-studio command not found; install/update the toolkit first."
+            fi
+        else
+            echo "Skipping Cosmos Media Studio."
+        fi
+    else
+        prompt_open_webui
+    fi
+
+    echo
+    echo "Launching $MODEL_NAME..."
+    echo
+
+    set +e
+    launch_vllm
+    rc=$?
+    set -e
+
+    if [[ "${STARTUP_INTERFACE:-open-webui}" == "cosmos-media-studio" ]]; then
+        prompt_leave_media_studio
+    else
+        prompt_leave_webui
+    fi
+
+    if ((rc == 0)); then
+        echo
+        echo "Server exited normally."
+    else
+        show_launch_failure "$rc"
+    fi
+    exit "$rc"
+fi
+
+select_llamacpp_runtime_and_context
+
+show_launch_summary
+read -rp "Launch? [Y/n]: " launch
+[[ "${launch:-Y}" =~ ^[Nn]$ ]] && exit 0
+
+cleanup_containers
+
+echo
+if ! prepare_image; then
+    exit 1
+fi
+
+echo
+echo "Launching $MODEL_NAME..."
+echo
+
+set +e
+launch_model
+rc=$?
+set -e
+
+if ((rc == 0)); then
+    echo
+    echo "Server exited normally."
+else
+    show_launch_failure "$rc"
+fi
+exit "$rc"

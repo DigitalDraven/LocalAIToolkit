@@ -1,0 +1,646 @@
+#!/usr/bin/env bash
+set -u
+
+# ai-add-model — guided creation of a new model profile
+# for the Local AI Toolkit (v2.5).
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
+MODELS_DIR="${MODELS_DIR:-$TOOLKIT_DIR/models}"
+TOOLKIT_VERSION="v2.7.5"
+
+# Bind MODELS_DIR to the detected platform.
+# shellcheck disable=SC1091
+source "$TOOLKIT_DIR/lib/common.sh"
+warn_legacy_command
+detect_platform
+
+# Default pinned digests (majority of current profiles).
+# User can override during the wizard.
+NVIDIA_IMAGE_DEFAULT="ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin@sha256:f7c67c102b08252e963f9e5f92c3a36554c8f69305eb7ea257c6cd12e24c3191"
+UPSTREAM_IMAGE_DEFAULT="ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:150b59966fb5b2cb1a8fa9d226267c56ebd22c520c7b3640331cde87f3c4fb01"
+
+NVIDIA_VOLUME='$HOME/.cache/huggingface/hub:/data/models/huggingface'
+UPSTREAM_VOLUME='$HOME/.cache/huggingface:/root/.cache/huggingface'
+
+COMMON_QUANTS=("Q4_K_M" "Q4_K_S" "Q5_K_M" "Q6_K" "Q8_0")
+CATEGORIES=("general-purpose" "coding" "reasoning" "vision" "large-context" "other")
+COMMON_CONTEXTS=(4096 8192 16384 32768 49152)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+prompt() {
+    local text="$1" def="${2:-}" reply
+    if [[ -n "$def" ]]; then
+        read -rp "$text [$def]: " reply
+        echo "${reply:-$def}"
+    else
+        read -rp "$text: " reply
+        echo "$reply"
+    fi
+}
+
+slugify() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g'
+}
+
+# Smarter MODEL_ID derivation from an HF repo path.
+# Strips owner, -GGUF, Instruct/IT, trailing date-like suffixes, and noise.
+derive_model_id() {
+    local stem
+    stem=$(echo "$1" | sed -E 's|.*/||')
+    stem=$(echo "$stem" | sed -E 's/-GGUF$//; s/-gguf$//; s/_GGUF$//; s/_gguf$//')
+    stem=$(echo "$stem" | sed -E 's/-Instruct//; s/-instruct//; s/-IT$//; s/-it$//')
+    # Drop pure date / build suffixes (e.g. -2512, -20241201)
+    stem=$(echo "$stem" | sed -E 's/-[0-9]{4}$//; s/-[0-9]{8}$//')
+    slugify "$stem"
+}
+
+# Human-friendly display name from repo.
+derive_display_name() {
+    local stem
+    stem=$(echo "$1" | sed -E 's|.*/||')
+    stem=$(echo "$stem" | sed -E 's/-GGUF$//; s/-gguf$//; s/_GGUF$//; s/_gguf$//')
+    stem=$(echo "$stem" | sed -E 's/-Instruct//; s/-instruct//')
+    stem=$(echo "$stem" | sed -E 's/-[0-9]{4}$//; s/-[0-9]{8}$//')
+    # Title-case-ish: replace separators with spaces, capitalize words.
+    echo "$stem" | sed -E 's/[-_]+/ /g' | sed -E 's/\b(.)/\u\1/g'
+}
+
+next_profile_order() {
+    local max=0 order file
+    shopt -s nullglob
+    for file in "$MODELS_DIR"/*.conf; do
+        order=$(grep -E '^PROFILE_ORDER=' "$file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' || true)
+        if [[ "$order" =~ ^[0-9]+$ ]] && (( order > max )); then
+            max=$order
+        fi
+    done
+    shopt -u nullglob
+    echo $(( max + 10 ))
+}
+
+# Best-effort Hugging Face tree listing for GGUF quant tags.
+list_hf_quants() {
+    local repo="$1"
+    local url="https://huggingface.co/api/models/${repo}/tree/main"
+    local json names
+
+    json=$(curl -fsSL --max-time 8 --connect-timeout 4 "$url" 2>/dev/null) || return 0
+    [[ -z "$json" ]] && return 0
+
+    names=$(printf '%s\n' "$json" \
+        | grep -oE '"path"[[:space:]]*:[[:space:]]*"[^"]+\.gguf"' \
+        | sed -E 's/.*"path"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+        | grep -iE '\.gguf$' || true)
+
+    [[ -z "$names" ]] && return 0
+
+    # Capture common quant patterns including ternary-style tags (Q2_0_g64, etc.).
+    printf '%s\n' "$names" \
+        | sed -E 's/.*[-_.]((Q|IQ|F|BF)[0-9]+([._][A-Za-z0-9]+)*)(\.gguf)?$/\1/I' \
+        | grep -E '^(Q|IQ|F|BF)' \
+        | tr '[:lower:]' '[:upper:]' \
+        | sort -u
+}
+
+# Build a richer VALIDATED_CONTEXTS list: all common sizes <= recommended.
+build_validated_line() {
+    local rec="$1"
+    local -a vals=()
+    local c
+    for c in "${COMMON_CONTEXTS[@]}"; do
+        if (( c <= rec )); then
+            vals+=("$c")
+        fi
+    done
+    # Always include the recommended value even if it is not in the ladder.
+    local found=0
+    for c in "${vals[@]}"; do
+        [[ "$c" == "$rec" ]] && found=1 && break
+    done
+    if (( found == 0 )); then
+        vals+=("$rec")
+    fi
+    printf 'VALIDATED_CONTEXTS=(%s)' "${vals[*]}"
+}
+
+# ---------------------------------------------------------------------------
+# vLLM add-model (AGX Thor / DGX Spark)
+# ---------------------------------------------------------------------------
+
+run_vllm_add() {
+    local default_image
+    case "$PLATFORM" in
+        agx-thor)  default_image="nvcr.io/nvidia/vllm:26.09-py3" ;;
+        dgx-spark) default_image="nvcr.io/nvidia/vllm:26.09-py3" ;;
+        *)         default_image="" ;;
+    esac
+
+    clear
+    echo "============================================================"
+    printf "              Local AI Toolkit %s\n" "$TOOLKIT_VERSION"
+    echo "                    Add a Model (vLLM)"
+    echo "------------------------------------------------------------"
+    echo "  Platform : $(platform_label)"
+    echo "============================================================"
+    echo
+
+    local HF_REPO
+    while true; do
+        HF_REPO=$(prompt "Hugging Face repository (owner/name)")
+        HF_REPO="${HF_REPO// /}"
+        [[ -n "$HF_REPO" ]] || { echo "Repository is required."; continue; }
+        [[ "$HF_REPO" == */* ]] || { echo "Expected form: owner/name"; continue; }
+        break
+    done
+
+    local DEFAULT_NAME MODEL_NAME DEFAULT_ID MODEL_ID CONF_FILE
+    DEFAULT_NAME=$(derive_display_name "$HF_REPO")
+    MODEL_NAME=$(prompt "Model display name" "$DEFAULT_NAME")
+    [[ -n "$MODEL_NAME" ]] || die "Display name is required."
+
+    DEFAULT_ID=$(derive_model_id "$HF_REPO")
+    [[ -z "$DEFAULT_ID" ]] && DEFAULT_ID=$(slugify "$MODEL_NAME")
+    MODEL_ID=$(prompt "Model ID (filename stem)" "$DEFAULT_ID")
+    MODEL_ID=$(slugify "$MODEL_ID")
+    [[ -n "$MODEL_ID" ]] || die "Model ID is required."
+
+    CONF_FILE="$MODELS_DIR/${MODEL_ID}.conf"
+    if [[ -f "$CONF_FILE" ]]; then
+        echo
+        echo "A profile already exists at: $CONF_FILE"
+        overwrite=$(prompt "Overwrite it?" "n")
+        [[ "$overwrite" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+    fi
+
+    echo
+    echo "Model category/tag:"
+    local i
+    for i in "${!CATEGORIES[@]}"; do
+        printf "  %d) %s\n" "$((i+1))" "${CATEGORIES[$i]}"
+    done
+    local MODEL_NOTE sel
+    while true; do
+        sel=$(prompt "Selection" "1")
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#CATEGORIES[@]} )); then
+            MODEL_NOTE="${CATEGORIES[$((sel-1))]}"
+            if [[ "$MODEL_NOTE" == "other" ]]; then
+                MODEL_NOTE=$(prompt "Enter custom tag" "reasoning")
+            fi
+            break
+        else
+            echo "Invalid selection."
+        fi
+    done
+
+    local IMAGE
+    IMAGE=$(prompt "Container image" "$default_image")
+    [[ -n "$IMAGE" ]] || die "Image is required."
+
+    echo
+    echo "Default max model length:"
+    echo "  1) 8192"
+    echo "  2) 16384"
+    echo "  3) 32768"
+    echo "  4) 65536"
+    echo "  5) Custom"
+    local MAX_LEN
+    while true; do
+        sel=$(prompt "Selection" "4")
+        case "$sel" in
+            1) MAX_LEN=8192; break ;;
+            2) MAX_LEN=16384; break ;;
+            3) MAX_LEN=32768; break ;;
+            4) MAX_LEN=65536; break ;;
+            5)
+                MAX_LEN=$(prompt "Enter max model length")
+                [[ "$MAX_LEN" =~ ^[1-9][0-9]*$ ]] && break
+                echo "Must be a positive integer."
+                ;;
+            *) echo "Invalid selection." ;;
+        esac
+    done
+
+    local GPU_UTIL SHM TRUST NEEDS
+    GPU_UTIL=$(prompt "GPU memory utilization (0-1)" "0.85")
+    SHM=$(prompt "Shared memory size" "16g")
+    echo
+    echo "trust-remote-code?"
+    echo "  1) No"
+    echo "  2) Yes"
+    sel=$(prompt "Selection" "1")
+    TRUST=0
+    [[ "$sel" == "2" ]] && TRUST=1
+    echo
+    echo "Does this model need a Hugging Face token (gated)?"
+    echo "  1) Yes"
+    echo "  2) No"
+    sel=$(prompt "Selection" "1")
+    NEEDS=1
+    [[ "$sel" == "2" ]] && NEEDS=0
+
+    local EXTRA
+    EXTRA=$(prompt "Extra vLLM args (optional, space-separated)" "--enable-auto-tool-choice --reasoning-parser gemma4 --tool-call-parser gemma4")
+
+    local ORDER
+    ORDER=$(next_profile_order)
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Model profile will be created as:"
+    echo
+    echo "  ID              : $MODEL_ID"
+    echo "  Name            : $MODEL_NAME"
+    echo "  HF Model        : $HF_REPO"
+    echo "  Image           : $IMAGE"
+    echo "  Max len         : $MAX_LEN"
+    echo "  GPU util        : $GPU_UTIL"
+    echo "  Profile order   : $ORDER"
+    echo "  File            : $CONF_FILE"
+    echo
+    create=$(prompt "Create this model?" "Y")
+    [[ "$create" =~ ^[Nn]$ ]] && { echo "Aborted."; exit 0; }
+
+    mkdir -p "$MODELS_DIR"
+    cat > "$CONF_FILE" <<EOF
+MODEL_ID="$MODEL_ID"
+MODEL_NAME="$MODEL_NAME"
+ENABLED=1
+PROFILE_ORDER=$ORDER
+MODEL_NOTE="$MODEL_NOTE"
+BACKEND="vllm"
+
+IMAGE="$IMAGE"
+HF_MODEL="$HF_REPO"
+VOLUME_PATH="\$HOME/.cache/huggingface:/root/.cache/huggingface"
+
+PORT=8000
+HOST="0.0.0.0"
+SHM_SIZE="$SHM"
+GPU_MEMORY_UTILIZATION=$GPU_UTIL
+MAX_MODEL_LEN=$MAX_LEN
+RECOMMENDED_MAX_MODEL_LEN=$MAX_LEN
+VALIDATED_MAX_MODEL_LENS=($MAX_LEN)
+
+TRUST_REMOTE_CODE=$TRUST
+NEEDS_HF_TOKEN=$NEEDS
+
+VLLM_ARGS=(
+  $EXTRA
+)
+
+VLLM_PLUGINS=()
+ENV_VARS=()
+EOF
+
+    echo
+    echo "Model profile created successfully."
+    echo
+    echo "Next steps:"
+    echo "  1) Launch model"
+    echo "  2) Edit model profile"
+    echo "  3) Exit"
+    sel=$(prompt "Selection" "3")
+    case "$sel" in
+        1) exec "$TOOLKIT_DIR/start-ai" ;;
+        2) exec "$TOOLKIT_DIR/ai-edit-model" "$MODEL_ID" ;;
+        *) exit 0 ;;
+    esac
+}
+
+
+if [[ "${BACKEND:-}" == "vllm" ]]; then
+    run_vllm_add
+    exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# Main interactive flow
+# ---------------------------------------------------------------------------
+
+
+
+clear
+echo "============================================================"
+printf "             Local AI Toolkit %s\n" "$TOOLKIT_VERSION"
+echo "                    Add a Model"
+echo "============================================================"
+echo
+
+# --- Hugging Face repository ---
+while true; do
+    HF_REPO=$(prompt "Hugging Face repository (owner/name)")
+    HF_REPO="${HF_REPO// /}"
+    [[ -n "$HF_REPO" ]] || { echo "Repository is required."; continue; }
+    [[ "$HF_REPO" == */* ]] || { echo "Expected form: owner/name"; continue; }
+    break
+done
+
+# --- Quantization (best-effort HF query + fallback) ---
+echo
+echo "(Attempting to list GGUF files from Hugging Face…)"
+mapfile -t FOUND_QUANTS < <(list_hf_quants "$HF_REPO")
+
+QUANT=""
+if ((${#FOUND_QUANTS[@]} > 0)); then
+    echo "Available quantizations found in the repository:"
+    local_i=1
+    for q in "${FOUND_QUANTS[@]}"; do
+        printf "  %d) %s\n" "$local_i" "$q"
+        ((local_i++))
+    done
+    echo "  ${local_i}) Other / enter manually"
+    # Prefer Q4_K_M as default when present.
+    default_sel=1
+    for i in "${!FOUND_QUANTS[@]}"; do
+        if [[ "${FOUND_QUANTS[$i]}" == "Q4_K_M" ]]; then
+            default_sel=$((i+1))
+            break
+        fi
+    done
+    while true; do
+        sel=$(prompt "Selection" "$default_sel")
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#FOUND_QUANTS[@]} )); then
+            QUANT="${FOUND_QUANTS[$((sel-1))]}"
+            break
+        elif [[ "$sel" == "$local_i" ]]; then
+            QUANT=$(prompt "Enter quantization tag (e.g. Q4_K_M)")
+            QUANT="${QUANT// /}"
+            [[ -n "$QUANT" ]] && break
+            echo "Quantization is required."
+        else
+            echo "Invalid selection."
+        fi
+    done
+else
+    echo "Could not retrieve a file listing (offline or non-standard repo layout)."
+    echo "Falling back to common quantization choices."
+    echo
+    for i in "${!COMMON_QUANTS[@]}"; do
+        printf "  %d) %s\n" "$((i+1))" "${COMMON_QUANTS[$i]}"
+    done
+    echo "  $((${#COMMON_QUANTS[@]}+1))) Other / enter manually"
+    while true; do
+        sel=$(prompt "Selection" "1")
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#COMMON_QUANTS[@]} )); then
+            QUANT="${COMMON_QUANTS[$((sel-1))]}"
+            break
+        elif [[ "$sel" == "$((${#COMMON_QUANTS[@]}+1))" ]]; then
+            QUANT=$(prompt "Enter quantization tag (e.g. Q4_K_M)")
+            QUANT="${QUANT// /}"
+            [[ -n "$QUANT" ]] && break
+            echo "Quantization is required."
+        else
+            echo "Invalid selection."
+        fi
+    done
+fi
+
+HF_MODEL="${HF_REPO}:${QUANT}"
+
+# --- Display name ---
+DEFAULT_NAME=$(derive_display_name "$HF_REPO")
+MODEL_NAME=$(prompt "Model display name" "$DEFAULT_NAME")
+[[ -n "$MODEL_NAME" ]] || die "Display name is required."
+
+# --- MODEL_ID / filename (smarter default) ---
+DEFAULT_ID=$(derive_model_id "$HF_REPO")
+[[ -z "$DEFAULT_ID" ]] && DEFAULT_ID=$(slugify "$MODEL_NAME")
+
+MODEL_ID=$(prompt "Model ID (filename stem)" "$DEFAULT_ID")
+MODEL_ID=$(slugify "$MODEL_ID")
+[[ -n "$MODEL_ID" ]] || die "Model ID is required."
+
+CONF_FILE="$MODELS_DIR/${MODEL_ID}.conf"
+if [[ -f "$CONF_FILE" ]]; then
+    echo
+    echo "A profile already exists at: $CONF_FILE"
+    overwrite=$(prompt "Overwrite it?" "n")
+    [[ "$overwrite" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+fi
+
+# --- Category / MODEL_NOTE ---
+echo
+echo "Model category/tag:"
+for i in "${!CATEGORIES[@]}"; do
+    printf "  %d) %s\n" "$((i+1))" "${CATEGORIES[$i]}"
+done
+while true; do
+    sel=$(prompt "Selection" "1")
+    if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#CATEGORIES[@]} )); then
+        MODEL_NOTE="${CATEGORIES[$((sel-1))]}"
+        if [[ "$MODEL_NOTE" == "other" ]]; then
+            MODEL_NOTE=$(prompt "Enter custom tag" "general-purpose")
+        fi
+        break
+    else
+        echo "Invalid selection."
+    fi
+done
+
+# --- Recommended runtime ---
+echo
+echo "Default llama.cpp runtime:"
+echo "  1) NVIDIA Jetson"
+echo "  2) Upstream llama.cpp"
+while true; do
+    sel=$(prompt "Selection" "1")
+    case "$sel" in
+        1) RECOMMENDED_RUNTIME="nvidia-jetson"; break ;;
+        2) RECOMMENDED_RUNTIME="upstream"; break ;;
+        *) echo "Invalid selection." ;;
+    esac
+done
+
+# --- Image digests (override optional) ---
+NVIDIA_IMAGE="$NVIDIA_IMAGE_DEFAULT"
+UPSTREAM_IMAGE="$UPSTREAM_IMAGE_DEFAULT"
+
+echo
+echo "Image digests:"
+echo "  1) Use default pinned digests (recommended)"
+echo "  2) Override NVIDIA Jetson image/digest"
+echo "  3) Override upstream llama.cpp image/digest"
+echo "  4) Override both"
+while true; do
+    sel=$(prompt "Selection" "1")
+    case "$sel" in
+        1) break ;;
+        2)
+            NVIDIA_IMAGE=$(prompt "NVIDIA image reference" "$NVIDIA_IMAGE_DEFAULT")
+            break
+            ;;
+        3)
+            UPSTREAM_IMAGE=$(prompt "Upstream image reference" "$UPSTREAM_IMAGE_DEFAULT")
+            break
+            ;;
+        4)
+            NVIDIA_IMAGE=$(prompt "NVIDIA image reference" "$NVIDIA_IMAGE_DEFAULT")
+            UPSTREAM_IMAGE=$(prompt "Upstream image reference" "$UPSTREAM_IMAGE_DEFAULT")
+            break
+            ;;
+        *) echo "Invalid selection." ;;
+    esac
+done
+
+# --- Default context ---
+echo
+echo "Default context size:"
+echo "  1) 8192"
+echo "  2) 16384"
+echo "  3) 32768"
+echo "  4) 49152"
+echo "  5) Custom"
+while true; do
+    sel=$(prompt "Selection" "2")
+    case "$sel" in
+        1) RECOMMENDED_CONTEXT=8192; break ;;
+        2) RECOMMENDED_CONTEXT=16384; break ;;
+        3) RECOMMENDED_CONTEXT=32768; break ;;
+        4) RECOMMENDED_CONTEXT=49152; break ;;
+        5)
+            RECOMMENDED_CONTEXT=$(prompt "Enter context size")
+            if [[ "$RECOMMENDED_CONTEXT" =~ ^[1-9][0-9]*$ ]]; then
+                break
+            fi
+            echo "Context must be a positive integer."
+            ;;
+        *) echo "Invalid selection." ;;
+    esac
+done
+
+# Mode-aware recommendations: keep GUI conservative (cap at 16k when higher).
+if (( RECOMMENDED_CONTEXT > 16384 )); then
+    GUI_RECOMMENDED_CONTEXT=16384
+else
+    GUI_RECOMMENDED_CONTEXT=$RECOMMENDED_CONTEXT
+fi
+HEADLESS_RECOMMENDED_CONTEXT=$RECOMMENDED_CONTEXT
+
+VALIDATED_LINE=$(build_validated_line "$RECOMMENDED_CONTEXT")
+PROFILE_ORDER=$(next_profile_order)
+
+# --- Confirmation ---
+echo
+echo "------------------------------------------------------------"
+echo "Model profile will be created as:"
+echo
+printf "  %-16s: %s\n" "ID" "$MODEL_ID"
+printf "  %-16s: %s\n" "Name" "$MODEL_NAME"
+printf "  %-16s: %s\n" "HF Model" "$HF_MODEL"
+printf "  %-16s: %s\n" "Runtime" "$RECOMMENDED_RUNTIME (both runtimes available)"
+printf "  %-16s: %s\n" "Context" "$RECOMMENDED_CONTEXT  (GUI: $GUI_RECOMMENDED_CONTEXT)"
+printf "  %-16s: %s\n" "Validated" "${VALIDATED_LINE#VALIDATED_CONTEXTS=}"
+printf "  %-16s: %s\n" "Category" "$MODEL_NOTE"
+printf "  %-16s: %s\n" "Profile order" "$PROFILE_ORDER"
+printf "  %-16s: %s\n" "File" "$CONF_FILE"
+echo
+create=$(prompt "Create this model?" "Y")
+[[ "$create" =~ ^[Nn]$ ]] && { echo "Aborted."; exit 0; }
+
+# ------------------------------------------------------------------
+# Write profile
+# ------------------------------------------------------------------
+
+mkdir -p "$MODELS_DIR"
+
+if [[ "$RECOMMENDED_RUNTIME" == "nvidia-jetson" ]]; then
+    TOP_IMAGE="$NVIDIA_IMAGE"
+    TOP_VOLUME="$NVIDIA_VOLUME"
+    TOP_SERVER="llama-server"
+    RUNTIME_OPTIONS_LINE='RUNTIME_OPTIONS=("nvidia-jetson" "upstream")'
+else
+    TOP_IMAGE="$UPSTREAM_IMAGE"
+    TOP_VOLUME="$UPSTREAM_VOLUME"
+    TOP_SERVER=""
+    RUNTIME_OPTIONS_LINE='RUNTIME_OPTIONS=("upstream" "nvidia-jetson")'
+fi
+
+cat > "$CONF_FILE" <<EOF
+MODEL_ID="$MODEL_ID"
+MODEL_NAME="$MODEL_NAME"
+ENABLED=1
+PROFILE_ORDER=$PROFILE_ORDER
+MODEL_NOTE="$MODEL_NOTE"
+IMAGE="$TOP_IMAGE"
+SERVER_COMMAND="$TOP_SERVER"
+HF_MODEL="$HF_MODEL"
+VOLUME_PATH="$TOP_VOLUME"
+GPU_LAYERS=99
+FLASH_ATTN="--flash-attn on"
+EXTRA_ARGS="--host 0.0.0.0 --port 8080"
+RECOMMENDED_CONTEXT=$RECOMMENDED_CONTEXT
+GUI_RECOMMENDED_CONTEXT=$GUI_RECOMMENDED_CONTEXT
+HEADLESS_RECOMMENDED_CONTEXT=$HEADLESS_RECOMMENDED_CONTEXT
+$VALIDATED_LINE
+EXPERIMENTAL_CONTEXTS=()
+
+RECOMMENDED_RUNTIME="$RECOMMENDED_RUNTIME"
+$RUNTIME_OPTIONS_LINE
+RUNTIME_IMAGE_NVIDIA_JETSON="$NVIDIA_IMAGE"
+RUNTIME_VOLUME_NVIDIA_JETSON="$NVIDIA_VOLUME"
+RUNTIME_SERVER_COMMAND_NVIDIA_JETSON="llama-server"
+RUNTIME_IMAGE_UPSTREAM="$UPSTREAM_IMAGE"
+RUNTIME_VOLUME_UPSTREAM="$UPSTREAM_VOLUME"
+RUNTIME_SERVER_COMMAND_UPSTREAM=""
+EOF
+
+echo
+echo "Model profile created successfully."
+echo "  $CONF_FILE"
+echo
+
+# ---------------------------------------------------------------------------
+# Post-create actions
+# ---------------------------------------------------------------------------
+
+echo "Next steps:"
+echo "  1) Launch model"
+echo "  2) Edit profile"
+echo "  3) Exit"
+while true; do
+    next=$(prompt "Selection" "3")
+    case "$next" in
+        1)
+            if command -v start-ai >/dev/null 2>&1; then
+                echo
+                echo "Handing off to start-ai…"
+                echo "(Select the new model from the menu.)"
+                echo
+                exec "$TOOLKIT_DIR/start-ai"
+            else
+                echo "start-ai is not available. Run it manually after sourcing ~/.bashrc."
+                exit 0
+            fi
+            ;;
+        2)
+            if command -v ai-edit-model >/dev/null 2>&1; then
+                exec ai-edit-model "$MODEL_ID"
+            else
+                editor="${EDITOR:-nano}"
+                if command -v "$editor" >/dev/null 2>&1; then
+                    "$editor" "$CONF_FILE"
+                else
+                    echo "Open $CONF_FILE in your preferred editor."
+                fi
+                exit 0
+            fi
+            ;;
+        3|"")
+            exit 0
+            ;;
+        *)
+            echo "Invalid selection."
+            ;;
+    esac
+done
+
