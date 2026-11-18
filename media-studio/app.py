@@ -99,7 +99,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Cosmos 3 Nano Media Studio", css="
                     with gr.Row():
                         image_width = gr.Dropdown([512, 768, 1024], value=512, label="Width")
                         image_height = gr.Dropdown([512, 768, 1024], value=512, label="Height")
-                    image_steps = gr.Slider(1, 30, value=15, step=1, label="Inference steps")
+                    image_steps = gr.Slider(1, 100, value=15, step=1, label="Inference steps")
                     image_seed = gr.Textbox(label="Seed (optional)", placeholder="Leave blank for default")
                     image_button = gr.Button("Generate image", variant="primary")
                 with gr.Column(scale=1):
@@ -116,7 +116,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Cosmos 3 Nano Media Studio", css="
                         video_height = gr.Dropdown([256, 512, 480], value=256, label="Height")
                     video_frames = gr.Slider(8, 64, value=16, step=8, label="Frames")
                     video_fps = gr.Dropdown([8, 12, 16, 24], value=8, label="Frames per second")
-                    video_steps = gr.Slider(1, 30, value=15, step=1, label="Inference steps")
+                    video_steps = gr.Slider(1, 100, value=15, step=1, label="Inference steps")
                     video_button = gr.Button("Generate video", variant="primary")
                 with gr.Column(scale=1):
                     video_result = gr.Video(label="Generated video", format="mp4")

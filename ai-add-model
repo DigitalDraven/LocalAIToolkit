@@ -7,7 +7,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
 MODELS_DIR="${MODELS_DIR:-$TOOLKIT_DIR/models}"
-TOOLKIT_VERSION="v2.7.5"
+TOOLKIT_VERSION="v2.7.7"
 
 # Bind MODELS_DIR to the detected platform.
 # shellcheck disable=SC1091

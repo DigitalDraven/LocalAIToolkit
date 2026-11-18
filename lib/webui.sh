@@ -61,6 +61,17 @@ ensure_open_webui() {
 prompt_open_webui() {
     local api_port="${PORT:-8000}"
     local ans
+
+    # Do not ask whether to start a service that is already running.
+    # Reuse the existing host-networked container and its standard UI port.
+    if webui_running; then
+        echo
+        echo "Open WebUI is already running — reusing it."
+        echo "  UI       : http://127.0.0.1:${WEBUI_HOST_PORT}"
+        echo "  API base : http://127.0.0.1:${api_port}/v1"
+        return 0
+    fi
+
     echo
     read -rp "Start Open WebUI against this server? [y/N]: " ans
     if [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]; then

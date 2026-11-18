@@ -83,6 +83,53 @@ network_ok() {
     return 1
 }
 
+# Hugging Face availability is checked separately from general internet access:
+# registry connectivity does not guarantee that huggingface.co or DNS is ready.
+huggingface_hub_ok() {
+    local attempt
+    for attempt in 1 2 3; do
+        if curl -fLsS --connect-timeout 2 --max-time 5 \
+            -o /dev/null https://huggingface.co/; then
+            return 0
+        fi
+        [[ "$attempt" == 3 ]] || sleep 2
+    done
+    return 1
+}
+
+hf_model_cached() {
+    local model="$1"
+    local repo_cache
+    [[ -n "$model" ]] || return 1
+
+    # A local model directory is already usable without Hub access.
+    [[ -d "$model" ]] && return 0
+
+    # Hugging Face Hub cache layout: models--ORG--NAME/snapshots/<revision>/...
+    repo_cache="$HOME/.cache/huggingface/hub/models--${model//\//--}/snapshots"
+    [[ -d "$repo_cache" ]] || return 1
+    find -L "$repo_cache" -mindepth 2 -maxdepth 2 -type f -print -quit 2>/dev/null | grep -q .
+}
+
+configure_hf_connectivity() {
+    if huggingface_hub_ok; then
+        HF_OFFLINE_MODE=0
+        echo "Hugging Face : online (Hub access enabled)"
+    else
+        HF_OFFLINE_MODE=1
+        echo "Hugging Face : unavailable (checking local model cache)"
+        if ! hf_model_cached "${HF_MODEL:-}"; then
+            echo
+            echo "ERROR: Hugging Face is unreachable and this model does not appear to be cached."
+            echo "       Connect to the internet and launch this model once to download its files."
+            echo "       Expected model: ${HF_MODEL:-<not set>}"
+            return 1
+        fi
+        echo "Offline mode : enabled (using cached model files)"
+    fi
+    return 0
+}
+
 prepare_image() {
     local short_digest runtime_label
     short_digest="${IMAGE##*sha256:}"
@@ -213,6 +260,14 @@ build_vllm_args() {
         VLLM_DOCKER_ARGS+=(--shm-size="${SHM_SIZE:-16g}")
     fi
 
+    # Hugging Face Hub connectivity is independent of Docker registry/network
+    # connectivity. Decide online/offline mode before creating the container.
+    if ! configure_hf_connectivity; then
+        return 1
+    fi
+    VLLM_DOCKER_ARGS+=(-e "HF_HUB_OFFLINE=${HF_OFFLINE_MODE}")
+    VLLM_DOCKER_ARGS+=(-e "TRANSFORMERS_OFFLINE=${HF_OFFLINE_MODE}")
+
     # Pass HF_TOKEN from the environment if set. Never print it.
     if [[ -n "${HF_TOKEN:-}" ]]; then
         VLLM_DOCKER_ARGS+=(-e HF_TOKEN)
@@ -268,7 +323,7 @@ build_vllm_args() {
 }
 
 launch_vllm() {
-    build_vllm_args
+    build_vllm_args || return $?
     sudo docker "${VLLM_DOCKER_ARGS[@]}"
 }
 

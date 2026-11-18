@@ -2,7 +2,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
-IMAGE_NAME="local-ai-toolkit/cosmos-media-studio:2.7.4"
+IMAGE_NAME="local-ai-toolkit/cosmos-media-studio:2.7.7"
 CONTAINER_NAME="cosmos-media-studio"
 OUTPUT_DIR="${COSMOS_MEDIA_OUTPUT_DIR:-$HOME/cosmos3-nano-media}"
 LEGACY_OUTPUT_DIR="$HOME/local-ai-toolkit-output/cosmos3-nano-media"

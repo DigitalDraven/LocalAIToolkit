@@ -2,7 +2,7 @@
 
 # Compatibility loader for the Local AI Toolkit modular library.
 
-TOOLKIT_VERSION="v2.7.5"
+TOOLKIT_VERSION="v2.7.7"
 TOOLKIT_NAME="Local AI Toolkit"
 
 # Callers should set TOOLKIT_DIR to the directory containing this toolkit

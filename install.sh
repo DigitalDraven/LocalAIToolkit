@@ -6,7 +6,7 @@ BIN_DIR="$HOME/bin"
 LEGACY_DIR="$HOME/.super-orin-ai"
 SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-echo "Installing Local AI Toolkit v2.7.5..."
+echo "Installing Local AI Toolkit v2.7.7..."
 mkdir -p "$INSTALL_DIR" "$BIN_DIR"
 mkdir -p "$INSTALL_DIR/models/orin-nano" "$INSTALL_DIR/models/agx-thor" "$INSTALL_DIR/models/dgx-spark" "$INSTALL_DIR/runtime/plugins"
 

@@ -1,8 +1,35 @@
-# Local AI Toolkit v2.7.5
+# Local AI Toolkit v2.7.7
+
+## v2.7.7 changes
+
+- Updates `cosmos3-nano-vllm-omni.conf` for both DGX Spark and AGX Thor to use the requested common Cosmos 3 Nano vLLM-Omni profile: `GPU_MEMORY_UTILIZATION=0.85`, `MAX_MODEL_LEN=32768`, and `RECOMMENDED_MAX_MODEL_LEN=32768`.
+- Replaces `--enable-layerwise-offload` with `--cache-backend sea_cache` and `--vae-use-tiling`, while retaining `--omni` and `--no-guardrails`. This aligns both platform profiles with the requested launch arguments and avoids silently keeping the older DGX Spark-specific argument set.
+- Adds the previously absent AGX Thor Cosmos 3 Nano profile so both platforms expose the same model ID, startup interface, model repository, cache mount, context settings, token requirement, and plugin/environment defaults. The profile note retains the user's DGX Spark validation wording; it does not claim independent AGX Thor validation.
+- Updates `prompt_open_webui()` in `lib/webui.sh` to check whether the Open WebUI container is already running before asking whether to start it. If it is running, the toolkit reports its UI/API addresses and reuses it without presenting a redundant yes/no prompt. If it is stopped or absent, the existing prompt and start/reuse behavior remain in place. This avoids asking users to start a service that is already available and prevents accidentally creating duplicate launch expectations.
+- Raises the maximum Cosmos Media Studio inference-step slider value from 30 to 100 for both image and video generation. The default remains 15 and the step increment remains 1, so existing behavior is unchanged unless the user selects a higher value. This gives users room to experiment with higher inference-step counts without hard-coding a new default.
+- Bumps the Cosmos Media Studio Docker image tag from `2.7.4` to `2.7.7`. The image contains a copy of `media-studio/app.py`; changing the tag forces the updated app to be rebuilt instead of silently reusing an older image with the 30-step slider limit.
+- Updates toolkit version metadata in the shared library, installer, `ai-add-model`, and `ai-edit-model` to v2.7.7.
+- No other model profiles, Hugging Face online/offline detection, existing Open WebUI data, or Cosmos Media Studio lifecycle behavior are intentionally changed. Open WebUI remains a separate container, and Cosmos Media Studio remains separate from the Cosmos inference server.
+
+- Updates `prompt_open_webui()` in `lib/webui.sh` to check whether the Open WebUI container is already running before asking whether to start it. If it is running, the toolkit reports its UI/API addresses and reuses it without presenting a redundant yes/no prompt. If it is stopped or absent, the existing prompt and start/reuse behavior remain in place. This avoids asking users to start a service that is already available and prevents accidentally creating duplicate launch expectations.
+- Raises the maximum Cosmos Media Studio inference-step slider value from 30 to 100 for both image and video generation. The default remains 15 and the step increment remains 1, so existing behavior is unchanged unless the user selects a higher value. This gives users room to experiment with higher inference-step counts without hard-coding a new default.
+- Bumps the Cosmos Media Studio Docker image tag from `2.7.4` to `2.7.7`. The image contains a copy of `media-studio/app.py`; changing the tag forces the updated app to be rebuilt instead of silently reusing an older image with the 30-step slider limit.
+- Updates toolkit version metadata in the shared library, installer, `ai-add-model`, and `ai-edit-model` to v2.7.7.
+- No model profiles, vLLM launch arguments, Hugging Face online/offline detection, existing Open WebUI data, or Cosmos backend settings are intentionally changed. Open WebUI remains a separate container, and Cosmos Media Studio remains separate from the Cosmos inference server.
+
 
 Configuration-driven launcher for local AI workloads on Super Orin Nano
 (llama.cpp), Jetson AGX Thor / DGX Spark (vLLM), and experimental generation
 frontends.
+
+## v2.7.6 changes
+
+- Adds a dedicated Hugging Face Hub connectivity check before launching vLLM. The existing `network_ok()` check remains responsible for general internet/Docker-registry availability; it is not treated as proof that `huggingface.co` is reachable.
+- Retries the Hugging Face HTTPS check up to three times with short timeouts. This handles brief DNS/network startup delays like the one observed during Gemma 4 startup.
+- Explicitly sets `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` inside vLLM containers: both are `0` when the Hugging Face Hub is reachable and both are `1` when it is not. This prevents repeated Hub requests in a genuinely offline launch.
+- Before allowing an offline launch, checks for a local Hugging Face model snapshot (or a directly supplied local model directory). If the model is not cached, launch is stopped with a clear instruction to connect and download it first rather than allowing vLLM to fail later with DNS errors.
+- Applies the behavior centrally in `lib/docker.sh` for vLLM launches, so DGX Spark and AGX Thor profiles share the same implementation. It does not alter model-specific images, arguments, plugins, or specialized Cosmos/Muse configuration.
+- Bumps shared, installer, and model-editor/add-model version labels to v2.7.6.
 
 ## v2.7.5 changes
 
