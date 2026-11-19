@@ -1,4 +1,47 @@
-# Local AI Toolkit v2.7.7
+# Local AI Toolkit v2.8.2
+
+## v2.8.2 — Apple Silicon runtime and documentation maintenance
+
+- Fixes Apple native vLLM-Metal launch argument handling so every item in a profile's `VLLM_ARGS` Bash array is forwarded as a distinct argument with its quoting preserved.
+- Updates the Apple Gemma 4 E2B profile with the M5-tested vLLM-Metal 0.33.0 recipe: Gemma 4 reasoning parser, thinking enabled by default, automatic tool choice, and Gemma 4 tool-call parser. Removes reliance on an unavailable external chat-template path.
+- Raises the Gemma 4 E2B Apple profile GPU memory utilization setting to the M5-tested value of `0.55`; retains the 4K and 8K context choices.
+- Adds the Gemma 4 family reasoning/tool-call arguments to the E4B profile, but explicitly marks E4B runtime and memory behavior as not yet independently validated.
+- Preserves Qwen 3.5's model-specific configuration; it benefits from the launcher fix without inheriting Gemma-specific parsers.
+- Updates platform interface documentation and Apple Silicon validation notes. NVIDIA and Jetson inference profiles are otherwise unchanged.
+
+**Validation scope:** Gemma 4 E2B native text inference, 8K context startup, reasoning configuration, automatic tool-choice initialization, and multimodal sidecar loading were observed on an M5 MacBook Air with vLLM-Metal 0.33.0. Actual tool execution and image/audio/video generation are not claimed as validated. E4B is not runtime-validated by this release.
+
+## Release path
+
+- `v2.8.1`: Apple Silicon implementation, experimental.
+- `v2.8.2`: Apple Silicon launcher argument fix, Gemma 4 recipe updates, and platform interface documentation.
+- `v2.8.x`: on-device model validation, memory/performance tuning, and compatibility fixes.
+- `v3.0.0`: intended public release after the supported hardware paths and model profiles have passed validation.
+
+## Platforms
+
+| Platform | Backend | Inference mode | UI |
+|----------|---------|----------------|-----|
+| Super Orin Nano | llama.cpp | NVIDIA/Jetson container | llama.cpp / OpenAI API on port 8080 |
+| Jetson AGX Thor | vLLM | NVIDIA container | optional Open WebUI |
+| DGX Spark | vLLM / vLLM-Omni | NVIDIA container | optional Open WebUI / Cosmos Media Studio |
+| Apple Silicon M-series | vLLM-Metal / MLX | Native macOS | optional Open WebUI in Colima |
+
+## Web interfaces and service URLs
+
+Use these local URLs when the corresponding service is running:
+
+| Platform | Interface | Local URL |
+|----------|-----------|-----------|
+| Super Orin Nano / Jetson Orin Nano | [llama.cpp server / web UI](http://127.0.0.1:8080) | `http://127.0.0.1:8080` |
+| Jetson AGX Thor | [Open WebUI](http://127.0.0.1:8080) | `http://127.0.0.1:8080` |
+| DGX Spark | [Open WebUI](http://127.0.0.1:8080) | `http://127.0.0.1:8080` |
+| Apple Silicon M-series | [Open WebUI](http://127.0.0.1:8080) (Colima) | `http://127.0.0.1:8080` |
+| DGX Spark with a Cosmos model and Media Studio enabled | [Cosmos Media Studio](http://127.0.0.1:7860) | `http://127.0.0.1:7860` |
+
+The Jetson Orin Nano llama.cpp URL above reflects the toolkit deployment endpoint verified by the project owner. Open WebUI uses the toolkit's default host port `8080`; deployments that override `WEBUI_HOST_PORT` will use that configured port instead. Cosmos Media Studio is a separate optional service and is available at port `7860` when its container is running.
+
+`127.0.0.1` means the machine on which the browser is running. To access an interface from another device on the same network, use the host machine's LAN IP address and the same service port, provided the service is bound/published for LAN access and the host firewall permits it. For API clients, the vLLM OpenAI-compatible API is normally exposed separately on port `8000` at `/v1`; it is not the Open WebUI page.
 
 ## v2.7.7 changes
 
@@ -89,7 +132,7 @@ not recommended final-quality settings.
 cd local-ai-toolkit-v2
 chmod +x install.sh
 ./install.sh
-source ~/.bashrc
+source ~/.zshrc  # macOS default shell; use ~/.bashrc on Linux or if using Bash
 ```
 
 ## Commands

@@ -1,20 +1,34 @@
 #!/usr/bin/env bash
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE_PATH" ]]; do
+    SOURCE_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+    LINK_TARGET="$(readlink "$SOURCE_PATH")"
+    if [[ "$LINK_TARGET" == /* ]]; then
+        SOURCE_PATH="$LINK_TARGET"
+    else
+        SOURCE_PATH="$SOURCE_DIR/$LINK_TARGET"
+    fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
 TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
-
-# Start each AI session from a clean filesystem/page-cache baseline so the
-# RAM shown below reflects memory available for the actual session.
-sync
-if ! sudo sysctl -w vm.drop_caches=3 >/dev/null; then
-    echo "Warning: could not reclaim filesystem/page caches; continuing."
-fi
 
 # shellcheck disable=SC1091
 source "$TOOLKIT_DIR/lib/common.sh"
 
 detect_platform
+
+# Linux NVIDIA platforms retain the existing page-cache reclaim behavior.
+# macOS manages its own filesystem cache and must never run Linux sysctl keys.
+sync
+if [[ "$PLATFORM" == "apple-m" ]]; then
+    echo "macOS manages filesystem caching; no cache-clearing operation is required."
+else
+    if ! sudo sysctl -w vm.drop_caches=3 >/dev/null; then
+        echo "Warning: could not reclaim filesystem/page caches; continuing."
+    fi
+fi
 
 discover_profiles
 
@@ -88,6 +102,46 @@ select_llamacpp_runtime_and_context() {
     fi
 }
 
+select_vllm_metal_max_len() {
+    local rec i value next
+    rec="$(recommended_max_len)"
+    echo
+    echo "$MODEL_NAME"
+    echo "------------------------------------------------------------"
+    echo "Select maximum model length (profile suggestions; validate on this Mac):"
+    echo
+    echo "1) Recommended ($rec)"
+    CONTEXT_ALTS=()
+    for value in "${PROFILE_MAX_MODEL_LENS[@]:-}"; do
+        [[ "$value" == "$rec" ]] && continue
+        CONTEXT_ALTS+=("$value")
+    done
+    for i in "${!CONTEXT_ALTS[@]}"; do
+        echo "$((i+2))) ${CONTEXT_ALTS[$i]}"
+    done
+    next=$(( ${#CONTEXT_ALTS[@]} + 2 ))
+    echo "${next}) Custom (experimental; may exceed available unified memory)"
+    CONTEXT_CUSTOM_OPTION=$next
+    echo "0) Cancel"
+    echo
+    read -rp "Max-len selection: " cchoice
+    [[ "$cchoice" == "0" ]] && exit 0
+    if [[ "$cchoice" == "1" ]]; then
+        MAX_MODEL_LEN="$rec"
+        CONTEXT_LABEL="recommended"
+    elif [[ "$cchoice" =~ ^[0-9]+$ ]] && (( cchoice >= 2 && cchoice < next )); then
+        MAX_MODEL_LEN="${CONTEXT_ALTS[$((cchoice-2))]}"
+        CONTEXT_LABEL="profile suggestion"
+    elif (( cchoice == CONTEXT_CUSTOM_OPTION )); then
+        read -rp "Enter max model length: " MAX_MODEL_LEN
+        [[ "$MAX_MODEL_LEN" =~ ^[1-9][0-9]*$ ]] || { echo "Max model length must be a positive integer."; exit 1; }
+        CONTEXT_LABEL="custom / experimental"
+    else
+        echo "Invalid selection."
+        exit 1
+    fi
+}
+
 select_vllm_max_len() {
     show_max_len_menu
     read -rp "Max-len selection: " cchoice
@@ -145,6 +199,41 @@ if [[ "$BACKEND" == "diffusers" ]]; then
         else
             echo "Stage A completed."
         fi
+    else
+        show_launch_failure "$rc"
+    fi
+    exit "$rc"
+fi
+
+
+if [[ "$BACKEND" == "vllm-metal" ]]; then
+    select_vllm_metal_max_len
+    show_vllm_metal_launch_summary
+    echo "Runtime  : Native macOS vLLM-Metal (MLX / Metal)"
+    echo "Container: Not used for inference"
+    echo "Optional : Open WebUI can run in Colima via Docker CLI"
+    echo
+    read -rp "Launch? [Y/n]: " launch
+    [[ "${launch:-Y}" =~ ^[Nn]$ ]] && exit 0
+
+    echo
+    if ! apple_prepare_vllm_metal; then
+        echo "Apple inference environment is not ready. No model server was started."
+        exit 1
+    fi
+
+    apple_prompt_open_webui
+    echo
+    echo "Launching $MODEL_NAME..."
+    echo "API: http://127.0.0.1:${PORT:-8000}/v1"
+    echo
+    set +e
+    apple_launch_vllm_metal
+    rc=$?
+    set -e
+    apple_prompt_leave_webui
+    if ((rc == 0)); then
+        echo "vLLM-Metal server exited normally."
     else
         show_launch_failure "$rc"
     fi

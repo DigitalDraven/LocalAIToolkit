@@ -2,17 +2,33 @@
 set -u
 
 # ai-edit-model — guided editing of an existing model profile
-# for the Local AI Toolkit (v2.5).
+# for the Local AI Toolkit (v2.8.2).
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE_PATH" ]]; do
+    SOURCE_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+    LINK_TARGET="$(readlink "$SOURCE_PATH")"
+    if [[ "$LINK_TARGET" == /* ]]; then
+        SOURCE_PATH="$LINK_TARGET"
+    else
+        SOURCE_PATH="$SOURCE_DIR/$LINK_TARGET"
+    fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
 TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
 MODELS_DIR="${MODELS_DIR:-$TOOLKIT_DIR/models}"
-TOOLKIT_VERSION="v2.7.7"
+TOOLKIT_VERSION="v2.8.2"
 
 # shellcheck disable=SC1091
 source "$TOOLKIT_DIR/lib/common.sh"
 warn_legacy_command
 detect_platform
+
+if [[ "$PLATFORM" == "apple-m" ]]; then
+    echo "The Apple Silicon profile editor is not included in v2.8.2."
+    echo "Review/edit the native vLLM-Metal profiles directly under: $MODELS_DIR"
+    exit 1
+fi
 
 die() {
     echo "Error: $*" >&2

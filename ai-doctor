@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE_PATH" ]]; do
+    SOURCE_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+    LINK_TARGET="$(readlink "$SOURCE_PATH")"
+    if [[ "$LINK_TARGET" == /* ]]; then
+        SOURCE_PATH="$LINK_TARGET"
+    else
+        SOURCE_PATH="$SOURCE_DIR/$LINK_TARGET"
+    fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
 TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
 # shellcheck disable=SC1091
 source "$TOOLKIT_DIR/lib/common.sh"
@@ -22,6 +32,27 @@ echo
 
 pass "Platform" "$(platform_label) / $(backend_label)"
 pass "Models dir" "$MODELS_DIR"
+
+if [[ "$PLATFORM" == "apple-m" ]]; then
+    nconf=0
+    shopt -s nullglob
+    for f in "$MODELS_DIR"/*.conf; do nconf=$((nconf + 1)); done
+    shopt -u nullglob
+    if (( nconf > 0 )); then pass "Model profiles" "$nconf found"; else fail "Model profiles" "none in $MODELS_DIR"; fi
+    discover_profiles
+    for profile in "${PROFILES[@]}"; do
+        load_profile "$profile" || { fail "Profile $profile" "could not load"; continue; }
+        if validate_profile; then
+            pass "Profile $profile" "valid / ${HF_MODEL:-no model reference}"
+        else
+            fail "Profile $profile" "invalid configuration"
+        fi
+    done
+    apple_doctor
+    echo
+    echo "Doctor complete."
+    exit 0
+fi
 
 nconf=0
 shopt -s nullglob

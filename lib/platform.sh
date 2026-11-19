@@ -27,6 +27,12 @@ _bind_platform() {
             PLATFORM_LABEL="DGX Spark"
             BACKEND_LABEL="vLLM"
             ;;
+        apple-m)
+            BACKEND="vllm-metal"
+            MODELS_DIR="$TOOLKIT_DIR/models/apple-m"
+            PLATFORM_LABEL="Apple Silicon (M-series)"
+            BACKEND_LABEL="vLLM-Metal / MLX"
+            ;;
         *)
             echo "Internal error: unknown PLATFORM='$PLATFORM'" >&2
             exit 1
@@ -43,27 +49,34 @@ _print_unsupported() {
     echo "  Tegra       : ${5:-n/a}"
     echo "  Chip id     : ${6:-n/a}"
     echo
-    echo "  Supported   : Super Orin Nano, Jetson AGX Thor, DGX Spark"
+    echo "  Supported   : Super Orin Nano, Jetson AGX Thor, DGX Spark, Apple Silicon M-series"
     echo
-    echo "  Override    : LAT_PLATFORM=orin-nano|agx-thor|dgx-spark"
+    echo "  Override    : LAT_PLATFORM=orin-nano|agx-thor|dgx-spark|apple-m"
 }
 
 detect_platform() {
     if [[ -n "${LAT_PLATFORM:-}" ]]; then
         case "$LAT_PLATFORM" in
-            orin-nano|agx-thor|dgx-spark)
+            orin-nano|agx-thor|dgx-spark|apple-m)
                 PLATFORM="$LAT_PLATFORM"
                 _bind_platform
                 return 0
                 ;;
             *)
-                echo "ERROR: LAT_PLATFORM='$LAT_PLATFORM' is not valid (orin-nano|agx-thor|dgx-spark)" >&2
+                echo "ERROR: LAT_PLATFORM='$LAT_PLATFORM' is not valid (orin-nano|agx-thor|dgx-spark|apple-m)" >&2
                 exit 1
                 ;;
         esac
     fi
 
     local dt product vendor family tegra chip blob
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+        if [[ "$(uname -m 2>/dev/null)" == "arm64" && "$(sysctl -n hw.optional.arm64 2>/dev/null)" == "1" ]]; then
+            PLATFORM="apple-m"; _bind_platform; return 0
+        fi
+        _print_unsupported "macOS" "$(sysctl -n hw.model 2>/dev/null || echo unknown)" "Apple" "Intel Mac or unsupported Apple hardware" "n/a" "n/a"
+        exit 1
+    fi
     dt="$(_read_file_trim /proc/device-tree/model)"
     product="$(_read_file_trim /sys/class/dmi/id/product_name)"
     vendor="$(_read_file_trim /sys/class/dmi/id/sys_vendor)"

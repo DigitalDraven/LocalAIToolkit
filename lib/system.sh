@@ -7,11 +7,16 @@ command_exists() {
 }
 
 gui_detected() {
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+        return 0
+    fi
     [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]
 }
 
 power_mode() {
-    if command_exists nvpmodel; then
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+        echo "Not applicable"
+    elif command_exists nvpmodel; then
         nvpmodel -q 2>/dev/null | head -1
     else
         echo "unknown"

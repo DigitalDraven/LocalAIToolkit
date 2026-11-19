@@ -4,11 +4,17 @@ set -u
 INSTALL_DIR="$HOME/.local-ai-toolkit"
 BIN_DIR="$HOME/bin"
 LEGACY_DIR="$HOME/.super-orin-ai"
-SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE_PATH" ]]; do
+    SOURCE_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+    LINK_TARGET="$(readlink "$SOURCE_PATH")"
+    if [[ "$LINK_TARGET" == /* ]]; then SOURCE_PATH="$LINK_TARGET"; else SOURCE_PATH="$SOURCE_DIR/$LINK_TARGET"; fi
+done
+SRC="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
 
-echo "Installing Local AI Toolkit v2.7.7..."
+echo "Installing Local AI Toolkit v2.8.2..."
 mkdir -p "$INSTALL_DIR" "$BIN_DIR"
-mkdir -p "$INSTALL_DIR/models/orin-nano" "$INSTALL_DIR/models/agx-thor" "$INSTALL_DIR/models/dgx-spark" "$INSTALL_DIR/runtime/plugins"
+mkdir -p "$INSTALL_DIR/models/orin-nano" "$INSTALL_DIR/models/agx-thor" "$INSTALL_DIR/models/dgx-spark" "$INSTALL_DIR/models/apple-m" "$INSTALL_DIR/runtime/plugins"
 
 cp -a "$SRC/lib" "$INSTALL_DIR/"
 cp -a "$SRC/runtime" "$INSTALL_DIR/"
@@ -79,8 +85,13 @@ NOTE
     fi
 fi
 
-if ! grep -q 'HOME/bin' "$HOME/.bashrc" 2>/dev/null; then
-    cat >> "$HOME/.bashrc" <<'EOFINNER'
+if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    SHELL_RC="$HOME/.zshrc"
+else
+    SHELL_RC="$HOME/.bashrc"
+fi
+if ! grep -Eq '^[[:space:]]*export[[:space:]]+PATH=.*(\$HOME|\$\{HOME\})/bin' "$SHELL_RC" 2>/dev/null; then
+    cat >> "$SHELL_RC" <<'EOFINNER'
 
 # Local AI Toolkit
 export PATH="$HOME/bin:$PATH"
@@ -102,5 +113,5 @@ echo "1.x names still work as shims: orin-status, orin-mode,"
 echo "  super-orin-add-model, super-orin-edit-model"
 echo
 echo "If this shell does not know the commands yet, run:"
-echo "  source ~/.bashrc"
+echo "  source $SHELL_RC"
 echo

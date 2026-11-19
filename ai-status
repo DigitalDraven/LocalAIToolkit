@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE_PATH" ]]; do
+    SOURCE_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+    LINK_TARGET="$(readlink "$SOURCE_PATH")"
+    if [[ "$LINK_TARGET" == /* ]]; then
+        SOURCE_PATH="$LINK_TARGET"
+    else
+        SOURCE_PATH="$SOURCE_DIR/$LINK_TARGET"
+    fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
 TOOLKIT_DIR="${TOOLKIT_DIR:-$SCRIPT_DIR}"
 # shellcheck disable=SC1091
 source "$TOOLKIT_DIR/lib/common.sh"
@@ -11,6 +21,23 @@ detect_platform
 
 print_ai_server_status() {
     local health models model context port matched plugin_string
+
+    if [[ "${BACKEND:-}" == "vllm-metal" ]]; then
+        port="${PORT:-8000}"
+        if curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+            printf "%-18s %s\n" "vLLM-Metal" "running"
+            printf "%-18s %s\n" "Port" "$port"
+            models="$(curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" 2>/dev/null || true)"
+            if command_exists jq && [[ -n "$models" ]]; then
+                model="$(printf '%s' "$models" | jq -r '.data[0].id // empty' 2>/dev/null)"
+                [[ -n "$model" ]] && printf "%-18s %s\n" "Model" "$model"
+            fi
+        else
+            printf "%-18s %s\n" "vLLM-Metal" "not running"
+        fi
+        if apple_webui_running; then printf "%-18s %s\n" "Open WebUI" "running (http://127.0.0.1:${APPLE_WEBUI_PORT})"; else printf "%-18s %s\n" "Open WebUI" "not running"; fi
+        return
+    fi
 
     if [[ "${BACKEND:-}" == "vllm" ]]; then
         port=8000
@@ -89,11 +116,13 @@ printf "%-18s %s\n" "Platform" "$(platform_label)"
 printf "%-18s %s\n" "Backend" "$(backend_label)"
 printf "%-18s %s\n" "Power mode" "$(power_mode)"
 printf "%-18s %s\n" "Desktop" "$(if gui_detected; then echo GUI; else echo Headless; fi)"
-printf "%-18s %s\n" "RAM" "$(free -h | awk '/^Mem:/ {print $3 " used / " $2 ", " $7 " available"}')"
-printf "%-18s %s\n" "Swap" "$(free -h | awk '/^Swap:/ {print $3 " used / " $2}')"
+printf "%-18s %s\n" "RAM" "$(ram_summary)"
+printf "%-18s %s\n" "Swap" "$(swap_summary)"
 printf "%-18s %s\n" "HF token" "$(hf_token_status)"
 
-if command_exists nvidia-smi; then
+if [[ "$PLATFORM" == "apple-m" ]]; then
+    printf "%-18s %s\n" "GPU" "Apple Metal (integrated GPU)"
+elif command_exists nvidia-smi; then
     printf "%-18s %s\n" "GPU" "nvidia-smi available"
 elif [[ -e /dev/nvhost-gpu ]]; then
     printf "%-18s %s\n" "GPU" "Jetson GPU device"
@@ -102,7 +131,7 @@ else
 fi
 
 print_ai_server_status
-if command_exists docker && docker container inspect cosmos-media-studio >/dev/null 2>&1; then
+if [[ "$PLATFORM" != "apple-m" ]] && command_exists docker && docker container inspect cosmos-media-studio >/dev/null 2>&1; then
     printf "%-18s %s\n" "Media Studio" "$(docker inspect -f '{{.State.Status}}' cosmos-media-studio)"
     printf "%-18s %s\n" "Media Studio URL" "http://127.0.0.1:7860"
 else

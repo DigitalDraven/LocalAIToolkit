@@ -23,9 +23,13 @@ show_dashboard() {
     printf "%-12s : %s\n" "Power" "$(power_mode)"
     printf "%-12s : %s\n" "RAM" "$(ram_summary)"
     printf "%-12s : %s\n" "Swap" "$(swap_summary)"
-    printf "%-12s : %s\n" "Docker" "$(if docker_ok; then echo '✓'; else echo '✗'; fi)"
-    printf "%-12s : %s\n" "Network" "$(if network_ok; then echo online; else echo offline; fi)"
-    printf "%-12s : %s\n" "HF token" "$(hf_token_status)"
+    if [[ "${PLATFORM:-}" == "apple-m" ]]; then
+        apple_dashboard
+    else
+        printf "%-12s : %s\n" "Docker" "$(if docker_ok; then echo '✓'; else echo '✗'; fi)"
+        printf "%-12s : %s\n" "Network" "$(if network_ok; then echo online; else echo offline; fi)"
+        printf "%-12s : %s\n" "HF token" "$(hf_token_status)"
+    fi
     if [[ "${BACKEND:-}" == "vllm" ]]; then
         if webui_running 2>/dev/null; then
             printf "%-12s : %s\n" "Open WebUI" "running (http://127.0.0.1:8080)"
@@ -153,7 +157,7 @@ show_diffusers_launch_summary() {
     echo "Image    : $IMAGE"
     echo "Output   : $HOME/${DIFFUSERS_OUTPUT_DIR:-local-ai-toolkit-output/${MODEL_ID}}"
     echo "HF token : $(hf_token_status)"
-    echo "RAM      : $(free -h | awk '/^Mem:/ {print $7 " available"}')"
+    echo "RAM      : $(ram_available_summary)"
     echo "------------------------------------------------------------"
     echo
 }
@@ -171,7 +175,25 @@ show_launch_summary() {
     fi
     echo "Context : $CONTEXT ($CONTEXT_LABEL)"
     echo "Mode    : $(system_mode)"
-    echo "RAM     : $(free -h | awk '/^Mem:/ {print $7 " available"}')"
+    echo "RAM     : $(ram_available_summary)"
+    echo "------------------------------------------------------------"
+    echo
+}
+
+show_vllm_metal_launch_summary() {
+    echo
+    echo "------------------------------------------------------------"
+    echo "Model    : $MODEL_NAME"
+    echo "Backend  : Native vLLM-Metal / MLX"
+    echo "Platform : $(platform_label)"
+    echo "HF model : $HF_MODEL"
+    echo "Download : ${MODEL_DOWNLOAD_SIZE:-size varies} (first launch only; cached afterward)"
+    echo "Disk min : ${MODEL_MIN_DISK_GB:-not specified} GB free recommended"
+    echo "Max len  : $MAX_MODEL_LEN ($CONTEXT_LABEL)"
+    echo "GPU util : ${GPU_MEMORY_UTILIZATION:-0.70}"
+    echo "Host     : ${HOST:-0.0.0.0}"
+    echo "Port     : ${PORT:-8000}"
+    echo "RAM      : $(ram_available_summary) available"
     echo "------------------------------------------------------------"
     echo
 }
@@ -187,7 +209,7 @@ show_vllm_launch_summary() {
     echo "GPU util : ${GPU_MEMORY_UTILIZATION:-0.85}"
     echo "Port     : ${PORT:-8000}"
     echo "HF token : $(hf_token_status)"
-    echo "RAM      : $(free -h | awk '/^Mem:/ {print $7 " available"}')"
+    echo "RAM      : $(ram_available_summary)"
     echo "------------------------------------------------------------"
     echo
 }
@@ -204,6 +226,12 @@ show_launch_failure() {
         echo "  • confirm the Hugging Face token is present"
         echo "  • confirm the Cosmos3 model is cached or network access is available"
         echo "  • Stage B API integration is intentionally separate from Stage A"
+    elif [[ "${BACKEND:-llamacpp}" == "vllm-metal" ]]; then
+        echo "If this was a vLLM-Metal startup failure:"
+        echo "  • verify macOS 15+ and Apple Silicon"
+        echo "  • check the vLLM-Metal Homebrew installation"
+        echo "  • try a smaller max model length or GPU memory utilization"
+        echo "  • verify Hugging Face connectivity and available disk space"
     elif [[ "${BACKEND:-llamacpp}" == "vllm" ]]; then
         echo "If this was a memory / max-len failure:"
         echo "  • retry with a smaller max model length"

@@ -3,7 +3,9 @@
 # Model profile loading, discovery, and validation.
 
 profile_defaults() {
-    unset MODEL_ID MODEL_NAME ENABLED PROFILE_ORDER MODEL_NOTE IMAGE HF_MODEL VOLUME_PATH
+    # BACKEND intentionally inherits the platform default; legacy Orin profiles
+    # do not declare BACKEND, while platform-specific profiles may override it.
+    unset MODEL_ID MODEL_NAME ENABLED PROFILE_ORDER MODEL_NOTE MODEL_DOWNLOAD_SIZE MODEL_MIN_DISK_GB IMAGE HF_MODEL VOLUME_PATH EXECUTION_MODE
     unset GPU_LAYERS FLASH_ATTN EXTRA_ARGS SERVER_COMMAND RECOMMENDED_CONTEXT
     unset VALIDATED_CONTEXTS EXPERIMENTAL_CONTEXTS
     unset GUI_RECOMMENDED_CONTEXT HEADLESS_RECOMMENDED_CONTEXT
@@ -11,9 +13,9 @@ profile_defaults() {
     unset RUNTIME_IMAGE_NVIDIA_JETSON RUNTIME_VOLUME_NVIDIA_JETSON RUNTIME_SERVER_COMMAND_NVIDIA_JETSON
     unset RUNTIME_IMAGE_UPSTREAM RUNTIME_VOLUME_UPSTREAM RUNTIME_SERVER_COMMAND_UPSTREAM
     unset PORT HOST SHM_SIZE GPU_MEMORY_UTILIZATION MAX_MODEL_LEN
-    unset RECOMMENDED_MAX_MODEL_LEN VALIDATED_MAX_MODEL_LENS
-    unset TRUST_REMOTE_CODE NEEDS_HF_TOKEN VLLM_ARGS CHAT_TEMPLATE_KWARGS VLLM_PLUGINS ENV_VARS\n    unset DIFFUSERS_MODE DIFFUSERS_PLUGINS DIFFUSERS_PIP_PACKAGES DIFFUSERS_PIPELINE DIFFUSERS_ARGS DIFFUSERS_OUTPUT_DIR
-    unset STARTUP_INTERFACE
+    unset RECOMMENDED_MAX_MODEL_LEN VALIDATED_MAX_MODEL_LENS PROFILE_MAX_MODEL_LENS
+    unset TRUST_REMOTE_CODE NEEDS_HF_TOKEN VLLM_ARGS CHAT_TEMPLATE_KWARGS VLLM_PLUGINS ENV_VARS    unset DIFFUSERS_MODE DIFFUSERS_PLUGINS DIFFUSERS_PIP_PACKAGES DIFFUSERS_PIPELINE DIFFUSERS_ARGS DIFFUSERS_OUTPUT_DIR
+    unset STARTUP_INTERFACE VLLM_METAL_ARGS
 }
 
 load_profile() {
@@ -53,7 +55,10 @@ discover_profiles() {
         local tmp
         tmp="$(mktemp)"
         printf '%s\n' "${entries[@]}" | sort -n -k1,1 -k2,2 | cut -f2- > "$tmp"
-        mapfile -t PROFILES < "$tmp"
+        PROFILES=()
+        while IFS= read -r profile; do
+            [[ -n "$profile" ]] && PROFILES+=("$profile")
+        done < "$tmp"
         rm -f "$tmp"
     fi
 }
@@ -63,6 +68,13 @@ validate_profile() {
     [[ -n "${MODEL_NAME:-}" ]] || return 1
 
     if ! model_enabled; then
+        return 0
+    fi
+
+    if [[ "${BACKEND:-llamacpp}" == "vllm-metal" ]]; then
+        [[ -n "${HF_MODEL:-}" ]] || return 1
+        [[ -n "${RECOMMENDED_MAX_MODEL_LEN:-${MAX_MODEL_LEN:-}}" ]] || return 1
+        [[ "${EXECUTION_MODE:-native}" == "native" ]] || return 1
         return 0
     fi
 

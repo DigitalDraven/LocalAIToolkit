@@ -2,7 +2,7 @@
 
 # Compatibility loader for the Local AI Toolkit modular library.
 
-TOOLKIT_VERSION="v2.7.7"
+TOOLKIT_VERSION="v2.8.2"
 TOOLKIT_NAME="Local AI Toolkit"
 
 # Callers should set TOOLKIT_DIR to the directory containing this toolkit
@@ -34,3 +34,7 @@ source "$TOOLKIT_DIR/lib/docker.sh"
 source "$TOOLKIT_DIR/lib/webui.sh"
 # shellcheck disable=SC1091
 source "$TOOLKIT_DIR/lib/ui.sh"
+
+# Apple Silicon native inference and optional Colima/Open WebUI integration.
+# shellcheck disable=SC1091
+source "$TOOLKIT_DIR/lib/apple.sh"
